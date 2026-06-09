@@ -24,6 +24,7 @@ import config as cfg
 from src.features import MasterFeatureBuilder
 from src.features.models.feature_spec import serialize_feature_specs
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
+from src.timeframes import duration_to_bars
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -68,12 +69,17 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
         "name": getattr(cfg, "ACTIVE_MODEL_PROFILE", "dual_v1"),
         **cfg.get_model_profile(),
     }
+    timeframe_profile = cfg.get_timeframe_profile(model_profile["timeframe_profile"])
     return {
         "experiment": str(getattr(cfg, "ACTIVE_EXPERIMENT", "default")),
         "labeling_profile": str(getattr(cfg, "LABELING_PROFILE", "default")),
         "training_profile": str(getattr(cfg, "TRAINING_PROFILE", "default")),
         "labeling": {
-            "horizon": int(getattr(cfg, "HORIZON", 0)),
+            "horizon": duration_to_bars(
+                str(getattr(cfg, "HORIZON_DURATION", "12h")),
+                timeframe_profile["timeframe"],
+            ),
+            "horizon_duration": str(getattr(cfg, "HORIZON_DURATION", "12h")),
             "tp_pct": float(getattr(cfg, "TP_PCT", 0.0)),
             "sl_pct": float(getattr(cfg, "SL_PCT", 0.0)),
             "use_dynamic_barriers": bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", False)),
@@ -86,6 +92,9 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
         "training": {
             "model_profile": model_profile["name"],
             "model_mode": model_profile["mode"],
+            "timeframe_profile": model_profile["timeframe_profile"],
+            "timeframe": timeframe_profile["timeframe"],
+            "htf_timeframe": timeframe_profile["htf_timeframe"],
             "target_column": model_profile["target_column"],
             "feature_profile": model_profile["feature_profile"],
             "feature_clip_enabled": bool(getattr(cfg, "ENABLE_FEATURE_CLIP", False)),
@@ -149,7 +158,7 @@ def parse_args():
     parser.add_argument(
         "--purge-gap",
         type=int,
-        default=cfg.effective_max_label_horizon(),
+        default=None,
         help=(
             "Purge gap in timestamps between train and test folds to avoid triple-barrier "
             "target leakage (default = cfg.effective_max_label_horizon())."
@@ -216,9 +225,11 @@ def load_training_frame(db_path, symbols, model_profile=None):
     }
     source_target = str(model_profile["target_column"])
     mode = str(model_profile["mode"])
+    timeframe_profile = cfg.get_timeframe_profile(model_profile["timeframe_profile"])
+    timeframe = timeframe_profile["timeframe"]
 
     repository = HistoricalKlineRepository(db_path=db_path)
-    dataset = repository.load_feature_dataset(symbols)
+    dataset = repository.load_feature_dataset(symbols, timeframe=timeframe)
     if source_target not in dataset.columns:
         raise RuntimeError(
             f"Dataset is missing target column '{source_target}' for model profile "
@@ -269,6 +280,9 @@ def load_training_frame(db_path, symbols, model_profile=None):
     dataset.attrs["excluded_non_directional_rows"] = excluded_rows
     dataset.attrs["model_profile"] = model_profile["name"]
     dataset.attrs["model_mode"] = mode
+    dataset.attrs["timeframe_profile"] = model_profile["timeframe_profile"]
+    dataset.attrs["timeframe"] = timeframe
+    dataset.attrs["htf_timeframe"] = timeframe_profile["htf_timeframe"]
     dataset.attrs["source_target_column"] = source_target
     dataset.attrs["all_timestamps"] = all_timestamps
     dataset.attrs["all_timestamps_profile"] = build_timestamp_profile(all_timestamps)
@@ -594,6 +608,7 @@ def fit_model_with_internal_eval(
     feature_columns,
     seed,
     best_iterations_so_far=None,
+    purge_gap: int | None = None,
 ):
     model = build_model(seed=seed)
     eval_plan = resolve_internal_eval_plan(y_train.reset_index(drop=True))
@@ -601,6 +616,7 @@ def fit_model_with_internal_eval(
     internal_eval_slices = resolve_internal_eval_slices(
         n_rows=len(y_train),
         eval_size=internal_eval_size,
+        requested_purge_gap=purge_gap,
     )
     fit_end = int(internal_eval_slices["fit_end"])
     eval_start = int(internal_eval_slices["eval_start"])
@@ -1032,6 +1048,7 @@ def walk_forward_validation(
             feature_columns=feature_columns,
             seed=seed,
             best_iterations_so_far=best_iterations,
+            purge_gap=purge_gap,
         )
 
         eval_plan = fit_metadata["eval_plan"]
@@ -1572,7 +1589,11 @@ def log_feature_importance_ranking(model, feature_columns):
 
 
 def build_feature_formulas_payload(feature_columns, model_name, symbols, experiment_snapshot):
-    builder = MasterFeatureBuilder()
+    training_snapshot = experiment_snapshot.get("training", {})
+    builder = MasterFeatureBuilder(
+        timeframe=training_snapshot.get("timeframe"),
+        htf_timeframe=training_snapshot.get("htf_timeframe"),
+    )
     allowed_untracked = {SYMBOL_COLUMN}
     tracked_feature_columns = [column for column in feature_columns if column not in allowed_untracked]
     feature_specs = builder.collect_feature_specs(set(tracked_feature_columns))
@@ -1631,6 +1652,9 @@ def save_directional_artifacts(
         "feature_columns": feature_columns,
         "model_profile": model_profile["name"],
         "model_mode": model_profile["mode"],
+        "timeframe_profile": model_profile["timeframe_profile"],
+        "timeframe": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["timeframe"],
+        "htf_timeframe": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["htf_timeframe"],
         "target_column": model_profile["target_column"],
         "feature_profile": model_profile["feature_profile"],
         **build_model_label_metadata(model_profile),
@@ -1705,6 +1729,10 @@ def main():
     try:
         args = parse_args()
         model_profile = resolve_model_profile(args.model_profile)
+        if args.purge_gap is None:
+            args.purge_gap = cfg.effective_max_label_horizon(
+                model_profile["timeframe_profile"]
+            )
         if args.model_name is None:
             args.model_name = model_profile["artifact_name"]
         experiment_snapshot = build_experiment_snapshot(model_profile)

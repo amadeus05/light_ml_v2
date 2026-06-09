@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -8,6 +7,7 @@ from src.features.contracts.feature_builder_contract import FeatureBuilderContra
 from src.features.indicators import safe_ratio
 from src.features.models.feature_context import FeatureContext
 from src.features.models.feature_spec import feature_param, feature_spec
+from src.timeframes import timeframe_ratio
 
 
 class InteractionFeatureBuilder(FeatureBuilderContract):
@@ -39,7 +39,10 @@ class InteractionFeatureBuilder(FeatureBuilderContract):
         if "vol_ratio" in active:
             if "realized_vol_1h" not in frame.columns or "realized_vol_4h_returns_20" not in frame.columns:
                 raise ValueError("Feature 'vol_ratio' requires 'realized_vol_1h' and 'realized_vol_4h_returns_20'.")
-            realized_vol_4h_per_hour = frame["realized_vol_4h_returns_20"] / np.sqrt(4.0)
+            htf_to_main = timeframe_ratio(context.htf_timeframe, context.timeframe)
+            realized_vol_4h_per_hour = (
+                frame["realized_vol_4h_returns_20"] / np.sqrt(htf_to_main)
+            )
             output["vol_ratio"] = safe_ratio(frame["realized_vol_1h"], realized_vol_4h_per_hour)
 
         breadth_request = {
@@ -59,7 +62,7 @@ class InteractionFeatureBuilder(FeatureBuilderContract):
             if "delta_market_breadth_ema_fast_slow_1h" in active:
                 output["delta_market_breadth_ema_fast_slow_1h"] = breadth.diff(1)
             if "market_breadth_ema_fast_slow_1h_zscore" in active:
-                zscore_window = max(10, int(getattr(cfg, "MARKET_ZSCORE_WINDOW", 96)))
+                zscore_window = context.bars("96h", minimum=10)
                 breadth_mean = breadth.rolling(zscore_window).mean()
                 breadth_std = breadth.rolling(zscore_window).std().replace(0, np.nan)
                 output["market_breadth_ema_fast_slow_1h_zscore"] = (breadth - breadth_mean) / breadth_std

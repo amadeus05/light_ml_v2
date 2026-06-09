@@ -8,6 +8,7 @@ from .data import *
 from .exchanges import *
 from .execution import *
 from .features import *
+from .timeframes import *
 from .labeling import *
 from .paths import *
 from .trading import *

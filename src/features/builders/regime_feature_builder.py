@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -40,37 +39,48 @@ class RegimeFeatureBuilder(FeatureBuilderContract):
         high = frame["high"]
         low = frame["low"]
         volume = pd.to_numeric(frame["volume"], errors="coerce")
-        realized_vol_window = max(2, int(getattr(cfg, "REALIZED_VOL_WINDOW_1H", 24)))
-        range_short_window = max(2, int(getattr(cfg, "RANGE_COMPRESSION_SHORT_WINDOW_1H", 12)))
-        range_long_window = max(range_short_window + 1, int(getattr(cfg, "RANGE_COMPRESSION_LONG_WINDOW_1H", 48)))
-        volume_ratio_window = max(2, int(getattr(cfg, "VOLUME_RATIO_WINDOW_1H", 24)))
-        volume_zscore_window = max(24, int(getattr(cfg, "VOLUME_ZSCORE_WINDOW_1H", 24 * 7)))
-        volume_24h_window = max(2, int(getattr(cfg, "VOLUME_24H_WINDOW_1H", 24)))
+        realized_vol_window = context.bars("24h", minimum=2)
+        range_short_window = context.bars("12h", minimum=2)
+        range_long_window = context.bars("48h", minimum=range_short_window + 1)
+        volume_ratio_window = context.bars("24h", minimum=2)
+        volume_zscore_window = context.bars("7d", minimum=24)
+        volume_24h_window = context.bars("24h", minimum=2)
+        atr_6_window = context.bars("6h", minimum=2)
+        atr_14_window = context.bars("14h", minimum=2)
+        atr_48_window = context.bars("48h", minimum=atr_14_window + 1)
+        atr_100_window = context.bars("100h", minimum=atr_48_window + 1)
+        acceleration_window = context.bars("3h")
+        regime_window = context.bars("96h", minimum=10)
+        regime_age_window = context.bars("48h", minimum=2)
+        vol_of_vol_window = context.bars("12h", minimum=2)
 
         if "realized_vol_1h" in active:
             log_return_1h_1 = np.log(close / close.shift(1))
-            output["realized_vol_1h"] = log_return_1h_1.rolling(realized_vol_window).std()
+            hourly_scale = np.sqrt(context.bars("1h"))
+            output["realized_vol_1h"] = (
+                log_return_1h_1.rolling(realized_vol_window).std() * hourly_scale
+            )
 
         if {"atr_ratio_1h", "volatility_regime_change_1h", "volatility_acceleration_1h"}.intersection(active):
             atr_14 = context.indicator_cache.get_or_create(
-                "atr_14",
-                lambda: compute_atr(high, low, close, length=14),
+                f"atr_{atr_14_window}",
+                lambda: compute_atr(high, low, close, length=atr_14_window),
             )
             if "atr_ratio_1h" in active:
                 atr_100 = context.indicator_cache.get_or_create(
-                    "atr_100",
-                    lambda: compute_atr(high, low, close, length=100),
+                    f"atr_{atr_100_window}",
+                    lambda: compute_atr(high, low, close, length=atr_100_window),
                 )
                 output["atr_ratio_1h"] = safe_ratio(atr_14, atr_100)
 
             if {"volatility_regime_change_1h", "volatility_acceleration_1h"}.intersection(active):
                 atr_6 = context.indicator_cache.get_or_create(
-                    "atr_6",
-                    lambda: compute_atr(high, low, close, length=6),
+                    f"atr_{atr_6_window}",
+                    lambda: compute_atr(high, low, close, length=atr_6_window),
                 )
                 atr_48 = context.indicator_cache.get_or_create(
-                    "atr_48",
-                    lambda: compute_atr(high, low, close, length=48),
+                    f"atr_{atr_48_window}",
+                    lambda: compute_atr(high, low, close, length=atr_48_window),
                 )
                 regime_change = context.indicator_cache.get_or_create(
                     "volatility_regime_change_1h",
@@ -79,7 +89,9 @@ class RegimeFeatureBuilder(FeatureBuilderContract):
                 if "volatility_regime_change_1h" in active:
                     output["volatility_regime_change_1h"] = regime_change
                 if "volatility_acceleration_1h" in active:
-                    output["volatility_acceleration_1h"] = regime_change - regime_change.shift(3)
+                    output["volatility_acceleration_1h"] = (
+                        regime_change - regime_change.shift(acceleration_window)
+                    )
 
         if "range_compression_1h" in active:
             range_short = high.rolling(range_short_window).max() - low.rolling(range_short_window).min()
@@ -118,18 +130,21 @@ class RegimeFeatureBuilder(FeatureBuilderContract):
             rvol = output.get("realized_vol_1h")
             if rvol is None and "realized_vol_1h" in active:
                 log_return_1h_1 = np.log(close / close.shift(1))
-                rvol = log_return_1h_1.rolling(realized_vol_window).std()
+                rvol = (
+                    log_return_1h_1.rolling(realized_vol_window).std()
+                    * np.sqrt(context.bars("1h"))
+                )
 
             if rvol is not None:
                 if "vol_of_vol_1h" in active:
-                    output["vol_of_vol_1h"] = rvol.rolling(12).std()
+                    output["vol_of_vol_1h"] = rvol.rolling(vol_of_vol_window).std()
 
                 if "realized_vol_vs_ema" in active:
-                    rvol_ema = rvol.ewm(span=48, adjust=False).mean()
+                    rvol_ema = rvol.ewm(span=regime_age_window, adjust=False).mean()
                     output["realized_vol_vs_ema"] = safe_ratio(rvol - rvol_ema, rvol_ema)
 
                 if "volatility_regime_stability" in active:
-                    rvol_long_mean = rvol.rolling(96).mean()
+                    rvol_long_mean = rvol.rolling(regime_window).mean()
                     regime_high = rvol > (rvol_long_mean * 1.2)
                     regime_low = rvol < (rvol_long_mean * 0.8)
                     regime_label = pd.Series(1, index=frame.index, dtype=int)
@@ -137,24 +152,26 @@ class RegimeFeatureBuilder(FeatureBuilderContract):
                     regime_label.loc[regime_high] = 2
                     regime_groups = (regime_label != regime_label.shift(1)).cumsum()
                     regime_age = regime_label.groupby(regime_groups).cumcount() + 1
-                    output["volatility_regime_stability"] = regime_age.clip(0, 48) / 48.0
+                    output["volatility_regime_stability"] = (
+                        regime_age.clip(0, regime_age_window) / float(regime_age_window)
+                    )
 
                 if "high_vol_stress_indicator" in active:
                     atr_14 = context.indicator_cache.get_or_create(
-                        "atr_14",
-                        lambda: compute_atr(high, low, close, length=14),
+                        f"atr_{atr_14_window}",
+                        lambda: compute_atr(high, low, close, length=atr_14_window),
                     )
                     atr_48 = context.indicator_cache.get_or_create(
-                        "atr_48",
-                        lambda: compute_atr(high, low, close, length=48),
+                        f"atr_{atr_48_window}",
+                        lambda: compute_atr(high, low, close, length=atr_48_window),
                     )
                     atr_expanding = atr_14 > atr_48 * 1.1
-                    vol_high = rvol > rvol.rolling(96).quantile(0.75)
+                    vol_high = rvol > rvol.rolling(regime_window).quantile(0.75)
                     output["high_vol_stress_indicator"] = (atr_expanding & vol_high).astype(float)
 
                 if "vol_regime_classification" in active:
-                    rvol_33 = rvol.rolling(96).quantile(0.33)
-                    rvol_67 = rvol.rolling(96).quantile(0.67)
+                    rvol_33 = rvol.rolling(regime_window).quantile(0.33)
+                    rvol_67 = rvol.rolling(regime_window).quantile(0.67)
                     output["vol_regime_classification"] = (
                         (rvol > rvol_33).astype(int) + (rvol > rvol_67).astype(int)
                     )

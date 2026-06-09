@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -150,15 +149,23 @@ class HtfFeatureBuilder(FeatureBuilderContract):
         close = frame["close"]
         high = frame["high"]
         low = frame["low"]
-        realized_vol_window = max(2, int(getattr(cfg, "REALIZED_VOL_WINDOW_4H", 20)))
-        range_window = max(2, int(getattr(cfg, "RANGE_WINDOW_4H", 14)))
-        vwap_window = max(2, int(getattr(cfg, "VWAP_WINDOW_4H", 20)))
-        ema_slope_base_window = max(2, int(getattr(cfg, "EMA_SLOPE_BASE_WINDOW_4H", 21)))
-        ema_slope_window = max(2, int(getattr(cfg, "EMA_SLOPE_WINDOW_4H", 6)))
+        return_windows = {
+            "return_4h_1": context.bars("4h"),
+            "return_4h_3": context.bars("12h"),
+            "return_4h_7": context.bars("28h"),
+            "return_4h_14": context.bars("56h"),
+        }
+        realized_vol_window = context.bars("80h", minimum=2)
+        range_window = context.bars("56h", minimum=2)
+        vwap_window = context.bars("80h", minimum=2)
+        ema_slope_base_window = context.bars("84h", minimum=2)
+        ema_slope_window = context.bars("24h", minimum=2)
+        atr_window = context.bars("56h", minimum=2)
+        donchian_change_window = context.bars("12h")
+        htf_lag_window = context.bars("4h")
 
         if {"return_4h_1", "return_4h_3", "return_4h_7", "return_4h_14"}.intersection(active):
-            for period in (1, 3, 7, 14):
-                feature_name = f"return_4h_{period}"
+            for feature_name, period in return_windows.items():
                 if feature_name in active:
                     output[feature_name] = np.log(close / close.shift(period))
 
@@ -167,7 +174,7 @@ class HtfFeatureBuilder(FeatureBuilderContract):
             output["realized_vol_4h_returns_20"] = log_return_4h_1.rolling(realized_vol_window).std()
 
         if "adx_4h" in active:
-            output["adx_4h"] = compute_adx(high, low, close, length=14)
+            output["adx_4h"] = compute_adx(high, low, close, length=atr_window)
 
         structure_request = {
             "price_position_4h",
@@ -182,8 +189,8 @@ class HtfFeatureBuilder(FeatureBuilderContract):
             rolling_low = low.rolling(range_window).min()
             rolling_high = high.rolling(range_window).max()
             atr_14 = context.indicator_cache.get_or_create(
-                "atr_14",
-                lambda: compute_atr(high, low, close, length=14),
+                f"atr_{atr_window}",
+                lambda: compute_atr(high, low, close, length=atr_window),
             )
             if "price_position_4h" in active:
                 output["price_position_4h"] = safe_ratio(close - rolling_low, rolling_high - rolling_low)
@@ -192,8 +199,8 @@ class HtfFeatureBuilder(FeatureBuilderContract):
             if "distance_to_rolling_low_4h" in active:
                 output["distance_to_rolling_low_4h"] = safe_ratio(close - rolling_low, atr_14)
             if "breakout_quality_4h" in active:
-                prev_rolling_low = rolling_low.shift(1)
-                prev_rolling_high = rolling_high.shift(1)
+                prev_rolling_low = rolling_low.shift(htf_lag_window)
+                prev_rolling_high = rolling_high.shift(htf_lag_window)
                 breakout_quality = pd.Series(0.0, index=close.index)
                 upside_mask = close > prev_rolling_high
                 downside_mask = close < prev_rolling_low
@@ -211,7 +218,10 @@ class HtfFeatureBuilder(FeatureBuilderContract):
                 if "donchian_width_atr_4h" in active:
                     output["donchian_width_atr_4h"] = donchian_width_atr
                 if "donchian_width_change_4h" in active:
-                    output["donchian_width_change_4h"] = donchian_width_atr - donchian_width_atr.shift(3)
+                    output["donchian_width_change_4h"] = (
+                        donchian_width_atr
+                        - donchian_width_atr.shift(donchian_change_window)
+                    )
             if "ema_slope_4h" in active:
                 ema_base = context.indicator_cache.get_or_create(
                     "ema_base_4h",
@@ -230,5 +240,5 @@ class HtfFeatureBuilder(FeatureBuilderContract):
             output["zscore_vs_vwap_4h"] = (vwap_distance - vwap_distance_mean) / vwap_distance_std
 
         feature_columns = [column for column in output.columns if column != "timestamp"]
-        output[feature_columns] = output[feature_columns].shift(1)
+        output[feature_columns] = output[feature_columns].shift(htf_lag_window)
         return output

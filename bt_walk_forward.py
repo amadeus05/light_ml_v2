@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--purge-gap",
         type=int,
-        default=cfg.effective_max_label_horizon(),
+        default=None,
         help=(
             "Purge gap in timestamps between train and test folds (default: "
             "cfg.effective_max_label_horizon() for triple-barrier y safety)."
@@ -82,12 +82,15 @@ def resolve_model_profiles(profile_names: list[str]) -> list[dict]:
     names = list(dict.fromkeys(profile_names))
     profiles = [{"name": name, **cfg.get_model_profile(name)} for name in names]
     modes = {profile["mode"] for profile in profiles}
+    timeframe_profiles = {profile["timeframe_profile"] for profile in profiles}
 
     valid = len(profiles) == 1 or (len(profiles) == 2 and modes == {"long", "short"})
     if not valid:
         raise ValueError(
             "--model-profiles accepts one profile, or exactly long_v1 and short_v1 together."
         )
+    if len(timeframe_profiles) != 1:
+        raise ValueError("Combined model profiles must use the same timeframe profile.")
     profiles.sort(key=lambda profile: {"dual": 0, "long": 1, "short": 2}[profile["mode"]])
     return profiles
 
@@ -117,7 +120,11 @@ def load_candidate_and_training_frames(
     model_profiles: list[dict],
 ):
     repository = HistoricalKlineRepository(db_path=db_path)
-    frame = repository.load_feature_dataset(symbols)
+    timeframe_profile = cfg.get_timeframe_profile(model_profiles[0]["timeframe_profile"])
+    frame = repository.load_feature_dataset(
+        symbols,
+        timeframe=timeframe_profile["timeframe"],
+    )
     required_targets = [profile["target_column"] for profile in model_profiles]
     missing_targets = sorted(set(required_targets) - set(frame.columns))
     if missing_targets:
@@ -165,12 +172,20 @@ def load_candidate_and_training_frames(
             "profile": profile,
             "training_frame": training_frame,
             "feature_columns": feature_columns,
+            "purge_gap": cfg.effective_max_label_horizon(
+                profile["timeframe_profile"]
+            ),
         }
 
     return frame, candidate_frame, profile_contexts
 
 
-def fit_fold_model(train_df: pd.DataFrame, feature_columns: list[str], seed: int):
+def fit_fold_model(
+    train_df: pd.DataFrame,
+    feature_columns: list[str],
+    seed: int,
+    purge_gap: int | None = None,
+):
     clip_bounds = train.build_feature_clip_bounds(train_df, feature_columns)
     clipped_train = train.apply_feature_clip_bounds(train_df, clip_bounds)
 
@@ -185,6 +200,7 @@ def fit_fold_model(train_df: pd.DataFrame, feature_columns: list[str], seed: int
             w_train=w_train,
             feature_columns=feature_columns,
             seed=seed,
+            purge_gap=purge_gap,
         )
         return model, clip_bounds, fit_metadata
 
@@ -247,6 +263,7 @@ def build_profile_fold_predictions(
             train_df,
             feature_columns,
             seed + fold_idx + profile_offset,
+            purge_gap=context.get("purge_gap"),
         )
         clipped_test = train.apply_feature_clip_bounds(test_df, clip_bounds)
         clipped_test = clipped_test.dropna(subset=feature_columns)
@@ -485,6 +502,8 @@ def build_features_meta(
         }
     )
     model_mode = profiles[0]["mode"] if len(profiles) == 1 else "long_short"
+    timeframe_profile_name = profiles[0]["timeframe_profile"]
+    timeframe_profile = cfg.get_timeframe_profile(timeframe_profile_name)
     profile_modes = {profile["mode"] for profile in profiles}
     probability_semantics = {
         "p_long": (
@@ -503,6 +522,9 @@ def build_features_meta(
         "feature_columns_by_profile": feature_columns_by_profile,
         "model_profiles": [profile["name"] for profile in profiles],
         "model_mode": model_mode,
+        "timeframe_profile": timeframe_profile_name,
+        "timeframe": timeframe_profile["timeframe"],
+        "htf_timeframe": timeframe_profile["htf_timeframe"],
         "target_columns": {
             profile["name"]: profile["target_column"]
             for profile in profiles
@@ -578,6 +600,10 @@ def main():
     args = parse_args()
     model_profiles = resolve_model_profiles(args.model_profiles)
     args.model_profiles = [profile["name"] for profile in model_profiles]
+    if args.purge_gap is None:
+        args.purge_gap = cfg.effective_max_label_horizon(
+            model_profiles[0]["timeframe_profile"]
+        )
     if args.predictions_name is None:
         args.predictions_name = default_predictions_name(model_profiles)
 

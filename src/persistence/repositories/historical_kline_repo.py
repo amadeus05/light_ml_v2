@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -744,8 +745,13 @@ class HistoricalKlineRepository:
         )
         return total_loaded
 
-    def save_features(self, symbol: str | Symbol, df: pd.DataFrame) -> None:
-        table_name = self.feature_table_name(symbol)
+    def save_features(
+        self,
+        symbol: str | Symbol,
+        df: pd.DataFrame,
+        timeframe: str | None = None,
+    ) -> None:
+        table_name = self.feature_table_name(symbol, timeframe=timeframe)
         with self.connection_factory() as conn:
             df.to_sql(table_name, conn, if_exists="replace", index=False)
         logger.info(f"{self._symbol_name(symbol)} features saved ({len(df)} rows)")
@@ -755,10 +761,20 @@ class HistoricalKlineRepository:
             query = "SELECT name FROM sqlite_master WHERE type='table'"
             return {row[0] for row in conn.execute(query).fetchall()}
 
-    def load_features(self, symbol: str | Symbol) -> pd.DataFrame:
-        table_name = self.feature_table_name(symbol)
+    def load_features(
+        self,
+        symbol: str | Symbol,
+        timeframe: str | None = None,
+    ) -> pd.DataFrame:
+        table_name = self.feature_table_name(symbol, timeframe=timeframe)
         available_tables = self.list_tables()
         symbol_name = self._symbol_name(symbol)
+        if (
+            timeframe == "1h"
+            and table_name not in available_tables
+            and self.feature_table_name(symbol) in available_tables
+        ):
+            table_name = self.feature_table_name(symbol)
         if table_name not in available_tables:
             logger.warning("Skipping %s: table %s not found in DB", symbol_name, table_name)
             return pd.DataFrame()
@@ -776,20 +792,28 @@ class HistoricalKlineRepository:
         frame["symbol"] = symbol_name
         return frame
 
-    def load_feature_dataset(self, symbols: list[str | Symbol]) -> pd.DataFrame:
+    def load_feature_dataset(
+        self,
+        symbols: list[str | Symbol],
+        timeframe: str | None = None,
+    ) -> pd.DataFrame:
         db_file = Path(self.db_path)
         if not db_file.exists():
             raise FileNotFoundError(f"Database file not found: {db_file}")
 
-        frames = [self.load_features(symbol) for symbol in symbols]
+        frames = [self.load_features(symbol, timeframe=timeframe) for symbol in symbols]
         frames = [frame for frame in frames if not frame.empty]
         if not frames:
             raise RuntimeError("No feature tables found. Run etl.py first to populate *_features tables.")
 
         return pd.concat(frames, ignore_index=True)
 
-    def feature_table_exists(self, symbol: str | Symbol) -> bool:
-        return self.feature_table_name(symbol) in self.list_tables()
+    def feature_table_exists(
+        self,
+        symbol: str | Symbol,
+        timeframe: str | None = None,
+    ) -> bool:
+        return self.feature_table_name(symbol, timeframe=timeframe) in self.list_tables()
 
     def sync_candles(
         self,
@@ -888,8 +912,15 @@ class HistoricalKlineRepository:
     def _symbol_name(symbol: str | Symbol) -> str:
         return str(symbol) if isinstance(symbol, Symbol) else str(Symbol.from_string(symbol))
 
-    def feature_table_name(self, symbol: str | Symbol) -> str:
+    def feature_table_name(
+        self,
+        symbol: str | Symbol,
+        timeframe: str | None = None,
+    ) -> str:
         symbol_stub = self._symbol_name(symbol).replace("/", "_") + "_features"
+        if timeframe:
+            timeframe_stub = re.sub(r"[^a-zA-Z0-9]+", "_", timeframe).strip("_")
+            symbol_stub = f"{symbol_stub}_{timeframe_stub}"
         if self.exchange_code == self.LEGACY_EXCHANGE_CODE:
             return symbol_stub
         return f"{self.exchange_code}_{symbol_stub}"

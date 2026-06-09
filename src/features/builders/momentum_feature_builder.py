@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -112,20 +111,28 @@ class MomentumFeatureBuilder(FeatureBuilderContract):
             return output
 
         close = frame["close"]
-        ema_fast_window = max(2, int(getattr(cfg, "EMA_FAST_WINDOW", 12)))
-        ema_slow_window = max(ema_fast_window + 1, int(getattr(cfg, "EMA_SLOW_WINDOW", 48)))
+        return_windows = {
+            "return_1h_6": context.bars("6h"),
+            "return_1h_12": context.bars("12h"),
+            "return_1h_24": context.bars("24h"),
+        }
+        ema_fast_window = context.bars("12h", minimum=2)
+        ema_slow_window = context.bars("48h", minimum=ema_fast_window + 1)
+        rsi_window = context.bars("14h", minimum=2)
+        atr_window = context.bars("14h", minimum=2)
+        slope_short_window = context.bars("12h", minimum=2)
+        slope_long_window = context.bars("24h", minimum=slope_short_window + 1)
+        acceleration_window = context.bars("3h")
 
         if {"return_1h_6", "return_1h_12", "return_1h_24"}.intersection(active):
-            for period in (6, 12, 24):
-                feature_name = f"return_1h_{period}"
+            for feature_name, period in return_windows.items():
                 if feature_name in active:
                     output[feature_name] = np.log(close / close.shift(period))
 
         if "rsi_1h" in active:
-            rsi_len = max(2, int(getattr(cfg, "RSI_LENGTH", 14)))
             output["rsi_1h"] = context.indicator_cache.get_or_create(
-                f"rsi_close_{rsi_len}",
-                lambda: compute_rsi(close, rsi_len),
+                f"rsi_close_{rsi_window}",
+                lambda: compute_rsi(close, rsi_window),
             )
 
         ema_fast_slow = None
@@ -152,20 +159,20 @@ class MomentumFeatureBuilder(FeatureBuilderContract):
         }
         if slope_request.intersection(active):
             atr_14 = context.indicator_cache.get_or_create(
-                "atr_14",
-                lambda: compute_atr(frame["high"], frame["low"], close, length=14),
+                f"atr_{atr_window}",
+                lambda: compute_atr(frame["high"], frame["low"], close, length=atr_window),
             )
             slope_12 = None
             slope_24 = None
             if {"linear_regression_slope_atr_1h_12", "slope_acceleration_1h_12_24"}.intersection(active):
                 slope_12 = context.indicator_cache.get_or_create(
-                    "lr_close_12",
-                    lambda: compute_linear_regression_slope(close, 12),
+                    f"lr_close_{slope_short_window}",
+                    lambda: compute_linear_regression_slope(close, slope_short_window),
                 )
             if {"linear_regression_slope_atr_1h_24", "slope_acceleration_1h_12_24"}.intersection(active):
                 slope_24 = context.indicator_cache.get_or_create(
-                    "lr_close_24",
-                    lambda: compute_linear_regression_slope(close, 24),
+                    f"lr_close_{slope_long_window}",
+                    lambda: compute_linear_regression_slope(close, slope_long_window),
                 )
             if "linear_regression_slope_atr_1h_12" in active and slope_12 is not None:
                 output["linear_regression_slope_atr_1h_12"] = safe_ratio(slope_12, atr_14)
@@ -180,19 +187,21 @@ class MomentumFeatureBuilder(FeatureBuilderContract):
                 lambda: pd.Series(np.sign(close.diff()), index=close.index),
             )
             if "trend_persistence_score_12" in active:
-                output["trend_persistence_score_12"] = signed_step.rolling(12).mean()
+                output["trend_persistence_score_12"] = signed_step.rolling(slope_short_window).mean()
             if "trend_persistence_score_24" in active:
-                output["trend_persistence_score_24"] = signed_step.rolling(24).mean()
+                output["trend_persistence_score_24"] = signed_step.rolling(slope_long_window).mean()
 
         if "trend_efficiency_24h" in active:
             output["trend_efficiency_24h"] = context.indicator_cache.get_or_create(
                 "trend_efficiency_24h",
-                lambda: compute_trend_efficiency(close, 24),
+                lambda: compute_trend_efficiency(close, slope_long_window),
             )
 
         if "ema_slope_acceleration_1h" in active:
             if ema_fast_slow is None:
                 raise ValueError("Feature 'ema_slope_acceleration_1h' requires 'ema_fast_slow'.")
-            output["ema_slope_acceleration_1h"] = ema_fast_slow - ema_fast_slow.shift(3)
+            output["ema_slope_acceleration_1h"] = (
+                ema_fast_slow - ema_fast_slow.shift(acceleration_window)
+            )
 
         return output

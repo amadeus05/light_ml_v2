@@ -23,6 +23,11 @@ def parse_args():
     parser.add_argument("--db-path", default=cfg.DB_PATH, help="Path to SQLite database.")
     parser.add_argument("--symbols", nargs="+", default=cfg.SYMBOLS, help="Symbols to inspect.")
     parser.add_argument(
+        "--timeframe-profile",
+        choices=sorted(cfg.TIMEFRAME_PROFILES),
+        default=cfg.ACTIVE_TIMEFRAME_PROFILE,
+    )
+    parser.add_argument(
         "--sequence-lengths",
         nargs="+",
         type=int,
@@ -71,9 +76,14 @@ def default_sequence_lengths() -> list[int]:
     return sorted(set(length for length in lengths if length > 0)) or [48, 64]
 
 
-def load_target_frame(db_path: str, symbols: list[str]) -> pd.DataFrame:
+def load_target_frame(
+    db_path: str,
+    symbols: list[str],
+    timeframe_profile: str = cfg.ACTIVE_TIMEFRAME_PROFILE,
+) -> pd.DataFrame:
     repository = HistoricalKlineRepository(db_path=db_path)
-    frame = repository.load_feature_dataset(symbols)
+    timeframe = cfg.get_timeframe_profile(timeframe_profile)["timeframe"]
+    frame = repository.load_feature_dataset(symbols, timeframe=timeframe)
     frame = frame.dropna(subset=[train.TIMESTAMP_COLUMN, train.SYMBOL_COLUMN, train.TARGET_COLUMN]).copy()
     frame[train.TIMESTAMP_COLUMN] = pd.to_datetime(frame[train.TIMESTAMP_COLUMN], errors="coerce")
     frame = frame.dropna(subset=[train.TIMESTAMP_COLUMN])
@@ -514,7 +524,7 @@ def render_html_report(
 
 def main() -> None:
     args = parse_args()
-    frame = load_target_frame(args.db_path, args.symbols)
+    frame = load_target_frame(args.db_path, args.symbols, args.timeframe_profile)
     if frame.empty:
         raise RuntimeError("No labeled feature rows found. Run etl.py first.")
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -30,8 +29,8 @@ class PremiumFeatureBuilder(FeatureBuilderContract):
             raise ValueError("Premium features require raw column 'premium_index_close'.")
 
         premium_index = pd.to_numeric(frame["premium_index_close"], errors="coerce")
-        zscore_window = max(24, int(getattr(cfg, "PREMIUM_INDEX_ZSCORE_WINDOW_1H", 24 * 7)))
-        change_lookback = max(1, int(getattr(cfg, "PREMIUM_INDEX_CHANGE_LOOKBACK_1H", 24)))
+        zscore_window = context.bars("7d", minimum=24)
+        change_lookback = context.bars("24h")
 
         premium_zscore = None
         if {"premium_index_zscore_7d", "crowded_longs_score_1h", "crowded_shorts_score_1h"}.intersection(active):

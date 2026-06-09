@@ -38,17 +38,21 @@ class StructureFeatureBuilder(FeatureBuilderContract):
         high = frame["high"]
         low = frame["low"]
         volume = frame["volume"]
+        range_24h = context.bars("24h", minimum=2)
+        range_48h = context.bars("48h", minimum=3)
+        bollinger_20h = context.bars("20h", minimum=2)
+        atr_14h = context.bars("14h", minimum=2)
 
         if {"price_position_1h", "distance_to_support_1h", "distance_to_resistance_1h"}.intersection(active):
-            rolling_low = low.rolling(24).min()
-            rolling_high = high.rolling(24).max()
+            rolling_low = low.rolling(range_24h).min()
+            rolling_high = high.rolling(range_24h).max()
             if "price_position_1h" in active:
                 output["price_position_1h"] = safe_ratio(close - rolling_low, rolling_high - rolling_low)
 
             if {"distance_to_support_1h", "distance_to_resistance_1h"}.intersection(active):
                 atr_14 = context.indicator_cache.get_or_create(
-                    "atr_14",
-                    lambda: compute_atr(high, low, close, length=14),
+                    f"atr_{atr_14h}",
+                    lambda: compute_atr(high, low, close, length=atr_14h),
                 )
                 if "distance_to_support_1h" in active:
                     output["distance_to_support_1h"] = safe_ratio(close - rolling_low, atr_14)
@@ -57,8 +61,8 @@ class StructureFeatureBuilder(FeatureBuilderContract):
 
         if {"distance_to_session_high_1h", "distance_to_session_low_1h"}.intersection(active):
             atr_14 = context.indicator_cache.get_or_create(
-                "atr_14",
-                lambda: compute_atr(high, low, close, length=14),
+                f"atr_{atr_14h}",
+                lambda: compute_atr(high, low, close, length=atr_14h),
             )
             session_key = frame["timestamp"].dt.floor("D")
             session_high = high.groupby(session_key).cummax()
@@ -80,8 +84,8 @@ class StructureFeatureBuilder(FeatureBuilderContract):
         }
         if flat_request.intersection(active):
             atr_14 = context.indicator_cache.get_or_create(
-                "atr_14",
-                lambda: compute_atr(high, low, close, length=14),
+                f"atr_{atr_14h}",
+                lambda: compute_atr(high, low, close, length=atr_14h),
             )
 
             if {
@@ -90,8 +94,8 @@ class StructureFeatureBuilder(FeatureBuilderContract):
                 "range_center_distance_atr_1h_48",
                 "mean_reversion_pressure_1h",
             }.intersection(active):
-                range_low_48 = low.rolling(48).min()
-                range_high_48 = high.rolling(48).max()
+                range_low_48 = low.rolling(range_48h).min()
+                range_high_48 = high.rolling(range_48h).max()
                 range_width_48 = range_high_48 - range_low_48
                 range_position_48 = safe_ratio(close - range_low_48, range_width_48)
 
@@ -107,18 +111,18 @@ class StructureFeatureBuilder(FeatureBuilderContract):
                     output["mean_reversion_pressure_1h"] = -distance_from_center.clip(-1.0, 1.0)
 
             if "flat_efficiency_1h_24" in active:
-                trend_efficiency = compute_trend_efficiency(close, 24)
+                trend_efficiency = compute_trend_efficiency(close, range_24h)
                 output["flat_efficiency_1h_24"] = 1.0 - trend_efficiency.clip(0.0, 1.0)
 
             if "zscore_vs_vwap_1h" in active:
-                rolling_vwap = compute_rolling_vwap(close, high, low, volume, 24)
+                rolling_vwap = compute_rolling_vwap(close, high, low, volume, range_24h)
                 vwap_distance = close - rolling_vwap
-                vwap_distance_std = vwap_distance.rolling(24).std().replace(0, np.nan)
+                vwap_distance_std = vwap_distance.rolling(range_24h).std().replace(0, np.nan)
                 output["zscore_vs_vwap_1h"] = safe_ratio(vwap_distance, vwap_distance_std)
 
             if {"bollinger_percent_b_1h_20", "bollinger_bandwidth_atr_1h_20"}.intersection(active):
-                rolling_mean_20 = close.rolling(20).mean()
-                rolling_std_20 = close.rolling(20).std()
+                rolling_mean_20 = close.rolling(bollinger_20h).mean()
+                rolling_std_20 = close.rolling(bollinger_20h).std()
                 upper_band = rolling_mean_20 + 2.0 * rolling_std_20
                 lower_band = rolling_mean_20 - 2.0 * rolling_std_20
                 band_width = upper_band - lower_band

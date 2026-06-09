@@ -315,21 +315,26 @@ def execution_timestamp_for_decision_time(decision_ts: pd.Timestamp, timeframe: 
     return pd.to_datetime(decision_ts) - pd.to_timedelta(timeframe_to_ms(timeframe), unit="ms")
 
 
-def load_all_raw_data(symbols, db_path: str | None = None):
+def load_all_raw_data(
+    symbols,
+    timeframe: str = TIMEFRAME,
+    htf_timeframe: str = HTF_TIMEFRAME,
+    db_path: str | None = None,
+):
     all_data = {}
 
     print(f"Loading raw data for {len(symbols)} symbols...")
     for sym in symbols:
         try:
-            df_main = load_raw_candles(sym, TIMEFRAME, db_path=db_path)
-            df_htf = load_raw_candles(sym, HTF_TIMEFRAME, db_path=db_path)
+            df_main = load_raw_candles(sym, timeframe, db_path=db_path)
+            df_htf = load_raw_candles(sym, htf_timeframe, db_path=db_path)
 
             if df_main.empty:
-                print(f"Warning: {sym} has no main TF data ({TIMEFRAME})")
+                print(f"Warning: {sym} has no main TF data ({timeframe})")
                 continue
 
             if df_htf.empty:
-                print(f"Warning: {sym} has no HTF data ({HTF_TIMEFRAME})")
+                print(f"Warning: {sym} has no HTF data ({htf_timeframe})")
                 continue
 
             all_data[sym] = {"main": df_main, "htf": df_htf}
@@ -344,11 +349,12 @@ def load_precomputed_features(
     symbol: str,
     symbol_categories=None,
     required_columns: list | None = None,
+    timeframe: str | None = None,
     db_path: str | None = None,
 ) -> pd.DataFrame:
     repository = HistoricalKlineRepository(db_path=db_path or DB_PATH)
     try:
-        df = repository.load_features(symbol)
+        df = repository.load_features(symbol, timeframe=timeframe)
     except Exception:
         return pd.DataFrame()
 
@@ -565,6 +571,8 @@ def backtest(
         return
 
     model_mode = str(features_meta.get("model_mode", "dual"))
+    timeframe = str(features_meta.get("timeframe", TIMEFRAME))
+    htf_timeframe = str(features_meta.get("htf_timeframe", HTF_TIMEFRAME))
     if model_mode == "long_short" and not using_external_predictions:
         print("Error: long_short mode requires combined external predictions.")
         return
@@ -616,7 +624,12 @@ def backtest(
             f"{feature_clip_meta.get('upper_q', 0.99) * 100:.2f}%]"
         )
     print(f"Backtest window: {test_start_ts.isoformat()} to {test_end_ts.isoformat()}")
-    all_raw = load_all_raw_data(backtest_symbols, db_path=resolved_db_path)
+    all_raw = load_all_raw_data(
+        backtest_symbols,
+        timeframe=timeframe,
+        htf_timeframe=htf_timeframe,
+        db_path=resolved_db_path,
+    )
     if not all_raw:
         print("Error: no raw data for backtest.")
         return
@@ -627,8 +640,12 @@ def backtest(
     else:
         print("Feature mode: precomputed DB features (ETL)")
         required_feature_columns = feature_names + ["barrier_stop_pct", "barrier_take_pct"]
-    feature_timestamp_shift = pd.to_timedelta(timeframe_to_ms(TIMEFRAME), unit="ms")
-    execution_start_ts, execution_end_ts = build_execution_window(test_start_ts, test_end_ts, TIMEFRAME)
+    feature_timestamp_shift = pd.to_timedelta(timeframe_to_ms(timeframe), unit="ms")
+    execution_start_ts, execution_end_ts = build_execution_window(
+        test_start_ts,
+        test_end_ts,
+        timeframe,
+    )
 
     all_features = {}
     all_main_index = {}
@@ -637,6 +654,7 @@ def backtest(
             sym,
             symbol_categories=symbol_categories,
             required_columns=required_feature_columns,
+            timeframe=timeframe,
             db_path=resolved_db_path,
         )
         if feat_df.empty:
@@ -719,7 +737,7 @@ def backtest(
     print(f"   Initial Balance: ${initial_balance:.2f}")
     print(f"   Risk per Trade: {RISK_PER_TRADE * 100:.0f}%")
     print(f"   Leverage: {LEVERAGE:.0f}x")
-    print(f"   Main TF: {TIMEFRAME} | HTF: {HTF_TIMEFRAME}")
+    print(f"   Main TF: {timeframe} | HTF: {htf_timeframe}")
     if allow_longs and allow_shorts:
         direction_mode = "LONG+SHORT"
     elif allow_longs:

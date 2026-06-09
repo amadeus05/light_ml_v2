@@ -26,7 +26,13 @@ from src.features.models.feature_spec import FeatureSpec
 
 
 class MasterFeatureBuilder:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        timeframe: str | None = None,
+        htf_timeframe: str | None = None,
+    ) -> None:
+        self.timeframe = timeframe or str(getattr(cfg, "TIMEFRAME", "1h"))
+        self.htf_timeframe = htf_timeframe or str(getattr(cfg, "HTF_TIMEFRAME", "4h"))
         self.main_builders: list[FeatureBuilderContract] = [
             MomentumFeatureBuilder(),
             RegimeFeatureBuilder(),
@@ -56,8 +62,9 @@ class MasterFeatureBuilder:
         self,
         base_candle_map: dict[str, pd.DataFrame],
         htf_candle_map: dict[str, pd.DataFrame],
+        profile_name: str | None = None,
     ) -> FeaturePipelineResult:
-        request = self._resolve_request()
+        request = self.resolve_request(profile_name)
         model_features = set(request.active_features)
         pipeline_features = set(getattr(cfg, "FEATURE_PIPELINE_REQUIRED_FEATURES", []))
         requested_features = self.expand_feature_dependencies(
@@ -69,11 +76,13 @@ class MasterFeatureBuilder:
             candle_map=base_candle_map,
             builders=self.main_builders,
             requested_features=requested_features,
+            source_timeframe=self.timeframe,
         )
         htf_feature_map = self._build_symbol_map(
             candle_map=htf_candle_map,
             builders=self.htf_builders,
             requested_features=requested_features,
+            source_timeframe=self.htf_timeframe,
         )
 
         self._enrich_symbol_map(
@@ -185,6 +194,7 @@ class MasterFeatureBuilder:
         candle_map: dict[str, pd.DataFrame],
         builders: list[FeatureBuilderContract],
         requested_features: set[str],
+        source_timeframe: str,
     ) -> dict[str, pd.DataFrame]:
         built_map: dict[str, pd.DataFrame] = {}
         for symbol, source_df in candle_map.items():
@@ -193,6 +203,9 @@ class MasterFeatureBuilder:
             context = FeatureContext(
                 frame=frame,
                 symbol=symbol,
+                timeframe=self.timeframe,
+                htf_timeframe=self.htf_timeframe,
+                source_timeframe=source_timeframe,
                 indicator_cache=IndicatorCache(),
             )
             for builder in builders:
@@ -218,6 +231,13 @@ class MasterFeatureBuilder:
             context = FeatureContext(
                 frame=source_df,
                 symbol=symbol,
+                timeframe=self.timeframe,
+                htf_timeframe=self.htf_timeframe,
+                source_timeframe=(
+                    self.htf_timeframe
+                    if target_map is htf_feature_map
+                    else self.timeframe
+                ),
                 base_feature_map=base_feature_map,
                 htf_feature_map=htf_feature_map,
                 shared_cache=shared_cache,
@@ -274,6 +294,9 @@ class MasterFeatureBuilder:
             context = FeatureContext(
                 frame=output,
                 symbol=symbol,
+                timeframe=self.timeframe,
+                htf_timeframe=self.htf_timeframe,
+                source_timeframe=self.timeframe,
                 base_feature_map=feature_map,
                 shared_cache=shared_cache,
             )

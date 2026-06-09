@@ -1,3 +1,6 @@
+from .timeframes import TIMEFRAME_PROFILES
+
+
 ENABLE_FEATURE_CLIP = True
 FEATURE_CLIP_LOWER_Q = 0.01
 FEATURE_CLIP_UPPER_Q = 0.99
@@ -27,12 +30,24 @@ DUAL_V1_FEATURES = [
     "zscore_vs_vwap_4h",
 ]
 
+SHORT_ONLY_15M_FEATURES = []
+
 # Independent copies are intentional: long and short feature selection can
 # evolve separately without changing the existing dual model.
 LONG_V1_FEATURES = [*DUAL_V1_FEATURES]
 SHORT_V1_FEATURES = [*DUAL_V1_FEATURES]
+DUAL_15M_V1_FEATURES = [*DUAL_V1_FEATURES]
+LONG_15M_V1_FEATURES = [*LONG_V1_FEATURES]
+SHORT_15M_V1_FEATURES = [
+    *(SHORT_ONLY_15M_FEATURES or SHORT_V1_FEATURES)
+]
 MODEL_UNION_V1_FEATURES = sorted(
-    set(DUAL_V1_FEATURES) | set(LONG_V1_FEATURES) | set(SHORT_V1_FEATURES)
+    set(DUAL_V1_FEATURES)
+    | set(LONG_V1_FEATURES)
+    | set(SHORT_V1_FEATURES)
+    | set(DUAL_15M_V1_FEATURES)
+    | set(LONG_15M_V1_FEATURES)
+    | set(SHORT_15M_V1_FEATURES)
 )
 
 FEATURE_PROFILES = {
@@ -41,40 +56,23 @@ FEATURE_PROFILES = {
     "dual_v1": DUAL_V1_FEATURES,
     "long_v1": LONG_V1_FEATURES,
     "short_v1": SHORT_V1_FEATURES,
+    "dual_15m_v1": DUAL_15M_V1_FEATURES,
+    "long_15m_v1": LONG_15M_V1_FEATURES,
+    "short_15m_v1": SHORT_15M_V1_FEATURES,
     "model_union_v1": MODEL_UNION_V1_FEATURES,
-    "base_only": [
-        "realized_vol_1h",
-        "ema_fast_slow",
-        "return_1h_24",
-        "linear_regression_slope_atr_1h_24",
-        "trend_efficiency_24h",
-        "atr_ratio_1h",
-        "range_compression_1h",
-        "price_position_1h",
-        "relative_strength_vs_btc_24h",
-        "residual_return_24h",
-        "return_4h_3",
-        "return_4h_14",
-        "ema_slope_4h",
-        "realized_vol_4h_returns_20",
-        "market_breadth_pos_return_4h_3",
-        "market_dispersion_return_4h_3",
-        "zscore_vs_vwap_4h",
-        "vol_ratio",
-        "price_position_4h",
-        "adx_4h",
-    ],
 }
 
 MODEL_PROFILES = {
     "dual_v1": {
         "mode": "dual",
+        "timeframe_profile": "1h_v1",
         "feature_profile": "dual_v1",
         "target_column": "Target",
         "artifact_name": "lightgbm_target",
     },
     "long_v1": {
         "mode": "long",
+        "timeframe_profile": "1h_v1",
         "feature_profile": "long_v1",
         "target_column": "TargetLong",
         "positive_label": 1,
@@ -82,12 +80,47 @@ MODEL_PROFILES = {
     },
     "short_v1": {
         "mode": "short",
+        "timeframe_profile": "1h_v1",
         "feature_profile": "short_v1",
         "target_column": "TargetShort",
         "positive_label": 1,
         "artifact_name": "lightgbm_short",
     },
+    "dual_15m_v1": {
+        "mode": "dual",
+        "timeframe_profile": "15m_v1",
+        "feature_profile": "dual_15m_v1",
+        "target_column": "Target",
+        "artifact_name": "lightgbm_target_15m",
+    },
+    "long_15m_v1": {
+        "mode": "long",
+        "timeframe_profile": "15m_v1",
+        "feature_profile": "long_15m_v1",
+        "target_column": "TargetLong",
+        "positive_label": 1,
+        "artifact_name": "lightgbm_long_15m",
+    },
+    "short_15m_v1": {
+        "mode": "short",
+        "timeframe_profile": "15m_v1",
+        "feature_profile": "short_15m_v1",
+        "target_column": "TargetShort",
+        "positive_label": 1,
+        "artifact_name": "lightgbm_short_15m",
+    },
 }
+
+for _timeframe_profile_name in TIMEFRAME_PROFILES:
+    _profile_features = {
+        feature
+        for model_profile in MODEL_PROFILES.values()
+        if model_profile["timeframe_profile"] == _timeframe_profile_name
+        for feature in FEATURE_PROFILES[model_profile["feature_profile"]]
+    }
+    FEATURE_PROFILES[f"model_union_{_timeframe_profile_name}"] = sorted(
+        _profile_features
+    )
 
 ACTIVE_MODEL_PROFILE = "dual_v1"
 
@@ -98,6 +131,12 @@ def get_model_profile(name: str = ACTIVE_MODEL_PROFILE) -> dict:
         raise ValueError(f"Unknown model profile '{name}'. Known profiles: {known}")
 
     profile = dict(MODEL_PROFILES[name])
+    timeframe_profile = profile.get("timeframe_profile")
+    if timeframe_profile not in TIMEFRAME_PROFILES:
+        raise ValueError(
+            f"Model profile '{name}' references unknown timeframe profile "
+            f"'{timeframe_profile}'."
+        )
     feature_profile = profile.get("feature_profile")
     if feature_profile not in FEATURE_PROFILES:
         raise ValueError(

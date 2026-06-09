@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -63,8 +62,9 @@ class BtcRelativeFeatureBuilder(FeatureBuilderContract):
 
         asset_return_1h = np.log(merged["close"] / merged["close"].shift(1))
         btc_return_1h = np.log(merged["btc_close"] / merged["btc_close"].shift(1))
-        btc_var_24h = btc_return_1h.rolling(24).var().replace(0, np.nan)
-        beta_24h = asset_return_1h.rolling(24).cov(btc_return_1h) / btc_var_24h
+        window_24h = context.bars("24h", minimum=2)
+        btc_var_24h = btc_return_1h.rolling(window_24h).var().replace(0, np.nan)
+        beta_24h = asset_return_1h.rolling(window_24h).cov(btc_return_1h) / btc_var_24h
 
         if "relative_strength_vs_btc_24h" in active:
             output["relative_strength_vs_btc_24h"] = merged["return_1h_24"] - merged["btc_return_1h_24"]
@@ -74,9 +74,8 @@ class BtcRelativeFeatureBuilder(FeatureBuilderContract):
             output["residual_return_24h"] = merged["return_1h_24"] - (beta_24h * merged["btc_return_1h_24"])
 
         if "mcc_sign_agreement_btc_24h" in active:
-            win = max(2, int(getattr(cfg, "MCC_SIGN_BTC_WINDOW", 24)))
-            min_override = getattr(cfg, "MCC_SIGN_BTC_MIN_PERIODS", None)
-            min_periods = max(3, int(min_override)) if min_override is not None else max(3, win // 2)
+            win = window_24h
+            min_periods = max(3, win // 2)
             output["mcc_sign_agreement_btc_24h"] = rolling_matthews_corrcoef_sign_agreement(
                 asset_return_1h,
                 btc_return_1h,

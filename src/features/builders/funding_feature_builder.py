@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -30,8 +29,8 @@ class FundingFeatureBuilder(FeatureBuilderContract):
             raise ValueError("Funding features require raw column 'funding_rate'.")
 
         funding_rate = pd.to_numeric(frame["funding_rate"], errors="coerce")
-        zscore_window = max(24, int(getattr(cfg, "FUNDING_ZSCORE_WINDOW_1H", 24 * 7)))
-        change_lookback = max(1, int(getattr(cfg, "FUNDING_CHANGE_LOOKBACK_1H", 24)))
+        zscore_window = context.bars("7d", minimum=24)
+        change_lookback = context.bars("24h")
 
         funding_zscore = None
         if {"funding_rate_zscore_7d", "longs_overheated_1h", "shorts_overheated_1h"}.intersection(active):

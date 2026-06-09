@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import config as cfg
 import numpy as np
 import pandas as pd
 
@@ -29,9 +28,9 @@ class OpenInterestFeatureBuilder(FeatureBuilderContract):
             raise ValueError("Open interest features require raw column 'open_interest'.")
 
         open_interest = pd.to_numeric(frame["open_interest"], errors="coerce")
-        zscore_window = max(24, int(getattr(cfg, "OPEN_INTEREST_ZSCORE_WINDOW_1H", 24 * 7)))
-        lookback_8h = max(1, int(getattr(cfg, "OPEN_INTEREST_CHANGE_LOOKBACK_8H", 8)))
-        lookback_24h = max(1, int(getattr(cfg, "OPEN_INTEREST_CHANGE_LOOKBACK_24H", 24)))
+        zscore_window = context.bars("7d", minimum=24)
+        lookback_8h = context.bars("8h")
+        lookback_24h = context.bars("24h")
 
         rolling_mean = open_interest.rolling(zscore_window).mean()
         rolling_std = open_interest.rolling(zscore_window).std().replace(0, np.nan)

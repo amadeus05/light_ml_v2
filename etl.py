@@ -1,3 +1,4 @@
+import argparse
 import logging
 import re
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from src.exchanges.bybit.bybit_service import BybitService
 from src.features import MasterFeatureBuilder
 from src.features.indicators import compute_atr, safe_ratio
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
+from src.timeframes import duration_to_bars, timeframe_hours
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,12 +26,23 @@ BARRIER_OUTPUT_COLUMNS = ["barrier_stop_pct", "barrier_take_pct"]
 TARGET_OUTPUT_COLUMNS = ["Target", "TargetLong", "TargetShort"]
 
 
-def get_base_horizon() -> int:
-    return int(getattr(cfg, "HORIZON", 16))
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build timeframe-specific feature datasets.")
+    parser.add_argument(
+        "--timeframe-profile",
+        choices=sorted(cfg.TIMEFRAME_PROFILES),
+        default=cfg.ACTIVE_TIMEFRAME_PROFILE,
+    )
+    return parser.parse_args()
 
 
-def compute_effective_horizons(df: pd.DataFrame) -> np.ndarray:
-    base_horizon = max(1, get_base_horizon())
+def get_base_horizon(timeframe: str = "1h") -> int:
+    duration = str(getattr(cfg, "HORIZON_DURATION", f"{int(getattr(cfg, 'HORIZON', 16))}h"))
+    return duration_to_bars(duration, timeframe)
+
+
+def compute_effective_horizons(df: pd.DataFrame, timeframe: str = "1h") -> np.ndarray:
+    base_horizon = max(1, get_base_horizon(timeframe))
     if not bool(getattr(cfg, "ENABLE_ADAPTIVE_HORIZON", False)):
         return np.full(len(df), base_horizon, dtype=np.int32)
 
@@ -37,8 +50,14 @@ def compute_effective_horizons(df: pd.DataFrame) -> np.ndarray:
         logger.warning("Adaptive horizon enabled, but 'realized_vol_1h' is missing. Falling back to fixed horizon=%s.", base_horizon)
         return np.full(len(df), base_horizon, dtype=np.int32)
 
-    min_horizon = int(getattr(cfg, "ADAPTIVE_HORIZON_MIN", max(1, base_horizon // 2)))
-    max_horizon = int(getattr(cfg, "ADAPTIVE_HORIZON_MAX", base_horizon))
+    min_horizon = duration_to_bars(
+        str(getattr(cfg, "ADAPTIVE_HORIZON_MIN_DURATION", "8h")),
+        timeframe,
+    )
+    max_horizon = duration_to_bars(
+        str(getattr(cfg, "ADAPTIVE_HORIZON_MAX_DURATION", "20h")),
+        timeframe,
+    )
     if min_horizon > max_horizon:
         min_horizon, max_horizon = max_horizon, min_horizon
     min_horizon = max(1, min_horizon)
@@ -70,12 +89,16 @@ def compute_dynamic_barrier_stop_pct(
     atr_14: pd.Series,
     realized_vol_1h: pd.Series,
     effective_horizons: np.ndarray | None = None,
+    timeframe: str = "1h",
 ) -> pd.Series:
     atr_pct = safe_ratio(atr_14, close).abs()
     if effective_horizons is None:
-        horizon_sqrt = np.sqrt(float(get_base_horizon()))
+        horizon_sqrt = np.sqrt(float(get_base_horizon(timeframe)) * timeframe_hours(timeframe))
     else:
-        horizon_sqrt = np.sqrt(np.maximum(effective_horizons.astype(float), 1.0))
+        horizon_sqrt = np.sqrt(
+            np.maximum(effective_horizons.astype(float), 1.0)
+            * timeframe_hours(timeframe)
+        )
     horizon_vol_pct = realized_vol_1h.abs() * horizon_sqrt
 
     stop_pct = pd.concat(
@@ -95,11 +118,12 @@ def compute_dynamic_barrier_take_pct(stop_pct: pd.Series) -> pd.Series:
     return stop_pct * float(getattr(cfg, "BARRIER_TP_TO_SL_RATIO", 2.0))
 
 
-def attach_barrier_columns(df: pd.DataFrame) -> pd.DataFrame:
+def attach_barrier_columns(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
     output = df.copy()
     close = output["close"]
-    atr_14 = compute_atr(output["high"], output["low"], close, length=14)
-    effective_horizons = compute_effective_horizons(output)
+    atr_window = duration_to_bars("14h", timeframe, minimum=2)
+    atr_14 = compute_atr(output["high"], output["low"], close, length=atr_window)
+    effective_horizons = compute_effective_horizons(output, timeframe)
 
     if bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", True)):
         if "realized_vol_1h" not in output.columns:
@@ -109,6 +133,7 @@ def attach_barrier_columns(df: pd.DataFrame) -> pd.DataFrame:
             atr_14,
             output["realized_vol_1h"],
             effective_horizons=effective_horizons,
+            timeframe=timeframe,
         )
         output["barrier_take_pct"] = compute_dynamic_barrier_take_pct(output["barrier_stop_pct"])
     else:
@@ -199,12 +224,12 @@ def simulate_trade_outcome(
     return 0.0, None
 
 
-def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
+def triple_barrier_labeling(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
     labels = []
     long_labels = []
     short_labels = []
-    effective_horizons = compute_effective_horizons(df)
-    max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon()
+    effective_horizons = compute_effective_horizons(df, timeframe)
+    max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon(timeframe)
 
     opens = df["open"].values
     highs = df["high"].values
@@ -214,7 +239,7 @@ def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
 
     for i in range(len(df) - max_horizon):
         label = 0
-        horizon = int(effective_horizons[i]) if i < len(effective_horizons) else get_base_horizon()
+        horizon = int(effective_horizons[i]) if i < len(effective_horizons) else get_base_horizon(timeframe)
         long_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=1, horizon=horizon)
         short_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=-1, horizon=horizon)
         long_labels.append(int(long_pnl > 0))
@@ -237,11 +262,15 @@ def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
     return output
 
 
-def finalize_feature_frame(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+def finalize_feature_frame(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    timeframe: str = "1h",
+) -> pd.DataFrame:
     output = df.copy()
     input_rows = len(output)
-    effective_horizons = compute_effective_horizons(output)
-    max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon()
+    effective_horizons = compute_effective_horizons(output, timeframe)
+    max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon(timeframe)
     horizon_dropped_rows = min(max_horizon, len(output)) if max_horizon > 0 else 0
     if max_horizon > 0:
         if len(output) <= max_horizon:
@@ -299,12 +328,18 @@ def create_exchange_service() -> ExchangeContract:
     raise ValueError(f"Unsupported ACTIVE_EXCHANGE: {exchange_name}")
 
 
-def build_labeling_snapshot() -> dict:
+def build_labeling_snapshot(timeframe_profile: dict | None = None) -> dict:
+    timeframe_profile = timeframe_profile or cfg.get_timeframe_profile()
+    timeframe = timeframe_profile["timeframe"]
     return {
         "experiment": str(getattr(cfg, "ACTIVE_EXPERIMENT", "default")),
         "labeling_profile": str(getattr(cfg, "LABELING_PROFILE", "default")),
         "training_profile": str(getattr(cfg, "TRAINING_PROFILE", "default")),
-        "horizon": int(getattr(cfg, "HORIZON", 0)),
+        "timeframe_profile": timeframe_profile["name"],
+        "timeframe": timeframe,
+        "htf_timeframe": timeframe_profile["htf_timeframe"],
+        "horizon": get_base_horizon(timeframe),
+        "horizon_duration": str(getattr(cfg, "HORIZON_DURATION", "12h")),
         "use_dynamic_barriers": bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", False)),
         "barrier_atr_multiplier": float(getattr(cfg, "BARRIER_ATR_MULTIPLIER", 0.0)),
         "barrier_rvol_multiplier": float(getattr(cfg, "BARRIER_RVOL_MULTIPLIER", 0.0)),
@@ -312,8 +347,14 @@ def build_labeling_snapshot() -> dict:
         "barrier_min_pct": float(getattr(cfg, "BARRIER_MIN_PCT", 0.0)),
         "barrier_max_pct": float(getattr(cfg, "BARRIER_MAX_PCT", 0.0)),
         "adaptive_horizon": bool(getattr(cfg, "ENABLE_ADAPTIVE_HORIZON", False)),
-        "adaptive_horizon_min": int(getattr(cfg, "ADAPTIVE_HORIZON_MIN", 0)),
-        "adaptive_horizon_max": int(getattr(cfg, "ADAPTIVE_HORIZON_MAX", 0)),
+        "adaptive_horizon_min": duration_to_bars(
+            str(getattr(cfg, "ADAPTIVE_HORIZON_MIN_DURATION", "8h")),
+            timeframe,
+        ),
+        "adaptive_horizon_max": duration_to_bars(
+            str(getattr(cfg, "ADAPTIVE_HORIZON_MAX_DURATION", "20h")),
+            timeframe,
+        ),
         "adaptive_horizon_vol_low": float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_LOW", 0.0)),
         "adaptive_horizon_vol_high": float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_HIGH", 0.0)),
     }
@@ -396,19 +437,19 @@ def warn_if_history_starts_late(
 def build_candle_maps(
     repository: HistoricalKlineRepository,
     symbols_to_load: list,
+    timeframe: str,
+    htf_timeframe: str,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     base_candle_map: dict[str, pd.DataFrame] = {}
     htf_candle_map: dict[str, pd.DataFrame] = {}
 
     for symbol in symbols_to_load:
         symbol_name = str(symbol)
-        timeframe = str(getattr(cfg, "TIMEFRAME", "1h"))
-        htf_timeframe = str(getattr(cfg, "HTF_TIMEFRAME", "4h"))
         df = with_decision_timestamps(repository.load_candles(symbol, timeframe), timeframe)
         htf_df = with_decision_timestamps(repository.load_candles(symbol, htf_timeframe), htf_timeframe)
         funding_df = repository.load_funding_rates(symbol)
         premium_index_df = with_decision_timestamps(repository.load_premium_index_klines(symbol, timeframe), timeframe)
-        open_interest_df = repository.load_open_interest(symbol, str(getattr(cfg, "TIMEFRAME", "1h")))
+        open_interest_df = repository.load_open_interest(symbol, timeframe)
         if df.empty or htf_df.empty:
             logger.warning("%s: no data in DB (main=%s, htf=%s)", symbol_name, len(df), len(htf_df))
             continue
@@ -499,16 +540,23 @@ def attach_open_interest_context(
 
 
 def main() -> None:
+    args = parse_args()
+    timeframe_profile = cfg.get_timeframe_profile(args.timeframe_profile)
+    timeframe = timeframe_profile["timeframe"]
+    htf_timeframe = timeframe_profile["htf_timeframe"]
     exchange_service = create_exchange_service()
     repository = HistoricalKlineRepository(exchange_code=exchange_service.get_exchange_code())
     repository.init_schema()
-    labeling_snapshot = build_labeling_snapshot()
+    labeling_snapshot = build_labeling_snapshot(timeframe_profile)
 
     logger.info(
-        "Experiment=%s | labeling_profile=%s | training_profile=%s",
+        "Experiment=%s | labeling_profile=%s | training_profile=%s | timeframe_profile=%s (%s -> %s)",
         labeling_snapshot["experiment"],
         labeling_snapshot["labeling_profile"],
         labeling_snapshot["training_profile"],
+        labeling_snapshot["timeframe_profile"],
+        timeframe,
+        htf_timeframe,
     )
     logger.info(
         "ETL labeling config: horizon=%s | dynamic_barriers=%s | stop[min=%.4f max=%.4f] | tp/sl=%.2f",
@@ -531,8 +579,6 @@ def main() -> None:
 
     for symbol in symbols_to_load:
         symbol_name = str(symbol)
-        timeframe = str(getattr(cfg, "TIMEFRAME", "1h"))
-        htf_timeframe = str(getattr(cfg, "HTF_TIMEFRAME", "4h"))
         start_date = str(getattr(cfg, "START_DATE", "2023-01-01"))
         end_date = getattr(cfg, "END_DATE", None)
 
@@ -558,9 +604,21 @@ def main() -> None:
         open_interest_loaded = repository.sync_open_interest(exchange_service, symbol, timeframe, start_date, end_date)
         logger.info("%s open interest %s: %s new points", symbol_name, timeframe, open_interest_loaded)
 
-    base_candle_map, htf_candle_map = build_candle_maps(repository, symbols_to_load)
-    feature_builder = MasterFeatureBuilder()
-    pipeline_result = feature_builder.build(base_candle_map, htf_candle_map)
+    base_candle_map, htf_candle_map = build_candle_maps(
+        repository,
+        symbols_to_load,
+        timeframe,
+        htf_timeframe,
+    )
+    feature_builder = MasterFeatureBuilder(
+        timeframe=timeframe,
+        htf_timeframe=htf_timeframe,
+    )
+    pipeline_result = feature_builder.build(
+        base_candle_map,
+        htf_candle_map,
+        profile_name=f"model_union_{timeframe_profile['name']}",
+    )
     logger.info(
         "Feature build request resolved: profile=%s | blocks=%s | features=%s",
         pipeline_result.profile_name,
@@ -575,10 +633,14 @@ def main() -> None:
             logger.warning("%s: skipped, missing prepared feature inputs", symbol_name)
             continue
 
-        feature_df = attach_barrier_columns(feature_df)
-        feature_df = triple_barrier_labeling(feature_df)
-        feature_df = finalize_feature_frame(feature_df, list(pipeline_result.feature_columns))
-        repository.save_features(symbol, feature_df)
+        feature_df = attach_barrier_columns(feature_df, timeframe=timeframe)
+        feature_df = triple_barrier_labeling(feature_df, timeframe=timeframe)
+        feature_df = finalize_feature_frame(
+            feature_df,
+            list(pipeline_result.feature_columns),
+            timeframe=timeframe,
+        )
+        repository.save_features(symbol, feature_df, timeframe=timeframe)
         logger.info("%s: saved %s rows with %s requested features", symbol_name, len(feature_df), len(pipeline_result.feature_columns))
 
 
