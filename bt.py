@@ -133,6 +133,20 @@ def resolve_directional_signal(p_long: float, p_short: float) -> tuple[int, floa
     return 0, max(p_long, p_short), signal_gap
 
 
+def normalize_direction_probabilities(
+    proba,
+    model_mode: str,
+    external_predictions: bool = False,
+) -> tuple[float, float]:
+    if external_predictions or model_mode == "dual":
+        return float(proba[0]), float(proba[1])
+    if model_mode == "long":
+        return 0.0, float(proba[1])
+    if model_mode == "short":
+        return float(proba[1]), 0.0
+    raise ValueError(f"Unsupported model mode for direct probabilities: {model_mode}")
+
+
 def get_barrier_pcts(feature_row: pd.DataFrame | None) -> tuple[float | None, float | None]:
     if feature_row is None or feature_row.empty:
         return None, None
@@ -519,10 +533,6 @@ def backtest(
 ):
     print("Loading model and features...")
 
-    if not ALLOW_LONGS and not ALLOW_SHORTS:
-        print("Error: both ALLOW_LONGS and ALLOW_SHORTS are disabled.")
-        return
-
     # --- Load LightGBM model / metadata ---
     using_external_predictions = predictions is not None
     prediction_lookup = build_prediction_lookup(predictions)
@@ -552,6 +562,21 @@ def backtest(
             model = joblib.load(model_path)
     elif model is None and not using_external_predictions:
         print("Error: model must be provided when features_meta is passed without predictions.")
+        return
+
+    model_mode = str(features_meta.get("model_mode", "dual"))
+    if model_mode == "long_short" and not using_external_predictions:
+        print("Error: long_short mode requires combined external predictions.")
+        return
+    model_supports_longs = model_mode in {"dual", "long", "long_short"}
+    model_supports_shorts = model_mode in {"dual", "short", "long_short"}
+    allow_longs = bool(ALLOW_LONGS and model_supports_longs)
+    allow_shorts = bool(ALLOW_SHORTS and model_supports_shorts)
+    if not allow_longs and not allow_shorts:
+        print(
+            "Error: no trade direction is enabled by both the model profile "
+            "and ALLOW_LONGS/ALLOW_SHORTS."
+        )
         return
 
     feature_names = features_meta["feature_columns"]
@@ -695,9 +720,9 @@ def backtest(
     print(f"   Risk per Trade: {RISK_PER_TRADE * 100:.0f}%")
     print(f"   Leverage: {LEVERAGE:.0f}x")
     print(f"   Main TF: {TIMEFRAME} | HTF: {HTF_TIMEFRAME}")
-    if ALLOW_LONGS and ALLOW_SHORTS:
+    if allow_longs and allow_shorts:
         direction_mode = "LONG+SHORT"
-    elif ALLOW_LONGS:
+    elif allow_longs:
         direction_mode = "LONG ONLY"
     else:
         direction_mode = "SHORT ONLY"
@@ -936,17 +961,20 @@ def backtest(
                 stop_pct, take_pct = get_barrier_pcts(feature_row)
                 if stop_pct is None or take_pct is None:
                     continue
-                p_short = float(proba[0])
-                p_long = float(proba[1])
+                p_short, p_long = normalize_direction_probabilities(
+                    proba,
+                    model_mode=model_mode,
+                    external_predictions=using_external_predictions,
+                )
 
                 signal, direction_prob, signal_gap = resolve_directional_signal(p_long, p_short)
 
                 if signal == 0:
                     continue
 
-                if signal == 1 and not ALLOW_LONGS:
+                if signal == 1 and not allow_longs:
                     continue
-                if signal == -1 and not ALLOW_SHORTS:
+                if signal == -1 and not allow_shorts:
                     continue
 
                 if signal == 1:
