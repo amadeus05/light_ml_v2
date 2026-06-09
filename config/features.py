@@ -3,7 +3,7 @@ FEATURE_CLIP_LOWER_Q = 0.01
 FEATURE_CLIP_UPPER_Q = 0.99
 USE_SYMBOL_FEATURE = False
 
-PRODUCTION_V1_FEATURES = [
+DUAL_V1_FEATURES = [
     "adx_4h",
     "atr_ratio_1h",
     "cross_sectional_rank_ema_fast_slow_1h",
@@ -27,10 +27,17 @@ PRODUCTION_V1_FEATURES = [
     "zscore_vs_vwap_4h",
 ]
 
+# Independent copies are intentional: long and short feature selection can
+# evolve separately without changing the existing dual model.
+LONG_V1_FEATURES = [*DUAL_V1_FEATURES]
+SHORT_V1_FEATURES = [*DUAL_V1_FEATURES]
+
 FEATURE_PROFILES = {
     "all": "__all__",
     "empty": [],
-    "production_v1": PRODUCTION_V1_FEATURES,
+    "dual_v1": DUAL_V1_FEATURES,
+    "long_v1": LONG_V1_FEATURES,
+    "short_v1": SHORT_V1_FEATURES,
     "base_only": [
         "realized_vol_1h",
         "ema_fast_slow",
@@ -55,8 +62,53 @@ FEATURE_PROFILES = {
     ],
 }
 
+MODEL_PROFILES = {
+    "dual_v1": {
+        "mode": "dual",
+        "feature_profile": "dual_v1",
+        "target_column": "Target",
+        "artifact_name": "lightgbm_target",
+    },
+    "long_v1": {
+        "mode": "long",
+        "feature_profile": "long_v1",
+        "target_column": "TargetLong",
+        "positive_label": 1,
+        "artifact_name": "lightgbm_long",
+    },
+    "short_v1": {
+        "mode": "short",
+        "feature_profile": "short_v1",
+        "target_column": "TargetShort",
+        "positive_label": 1,
+        "artifact_name": "lightgbm_short",
+    },
+}
+
+ACTIVE_MODEL_PROFILE = "dual_v1"
+
+
+def get_model_profile(name: str = ACTIVE_MODEL_PROFILE) -> dict:
+    if name not in MODEL_PROFILES:
+        known = ", ".join(sorted(MODEL_PROFILES))
+        raise ValueError(f"Unknown model profile '{name}'. Known profiles: {known}")
+
+    profile = dict(MODEL_PROFILES[name])
+    feature_profile = profile.get("feature_profile")
+    if feature_profile not in FEATURE_PROFILES:
+        raise ValueError(
+            f"Model profile '{name}' references unknown feature profile "
+            f"'{feature_profile}'."
+        )
+    if not profile.get("target_column"):
+        raise ValueError(f"Model profile '{name}' must define target_column.")
+    if not profile.get("artifact_name"):
+        raise ValueError(f"Model profile '{name}' must define artifact_name.")
+    return profile
+
+
 FEATURE_BUILD_REQUEST = {
-    "profile": "production_v1",
+    "profile": get_model_profile()["feature_profile"],
     "include_features": [],
     "exclude_features": [],
     "exclude_blocks": [],
