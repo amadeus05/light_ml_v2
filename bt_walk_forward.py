@@ -354,9 +354,13 @@ def build_features_meta(
     symbols: list[str],
     args,
 ):
+    model_profile = {"name": "dual_v1", **cfg.get_model_profile("dual_v1")}
     return {
         "feature_columns": feature_columns,
-        "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
+        "model_profile": model_profile["name"],
+        "model_mode": model_profile["mode"],
+        "target_column": model_profile["target_column"],
+        "feature_profile": model_profile["feature_profile"],
         "label_mapping": {"short": 0, "long": 1},
         "inverse_label_mapping": {str(key): value for key, value in train.CLASS_TO_LABEL.items()},
         "symbols": list(symbols),

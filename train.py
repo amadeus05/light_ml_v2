@@ -32,10 +32,11 @@ logger = logging.getLogger(__name__)
 # Constants & label mappings
 # ---------------------------------------------------------------------------
 TARGET_COLUMN = "Target"
+MODEL_TARGET_COLUMNS = {"Target", "TargetLong", "TargetShort"}
 TIMESTAMP_COLUMN = "timestamp"
 SYMBOL_COLUMN = "symbol"
 RESERVED_COLUMNS = {
-    TARGET_COLUMN,
+    *MODEL_TARGET_COLUMNS,
     TIMESTAMP_COLUMN,
     "barrier_stop_pct",
     "barrier_take_pct",
@@ -62,7 +63,11 @@ def get_end_date_cutoff():
     return pd.to_datetime(end_date, errors="coerce")
 
 
-def build_experiment_snapshot() -> dict:
+def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
+    model_profile = model_profile or {
+        "name": getattr(cfg, "ACTIVE_MODEL_PROFILE", "dual_v1"),
+        **cfg.get_model_profile(),
+    }
     return {
         "experiment": str(getattr(cfg, "ACTIVE_EXPERIMENT", "default")),
         "labeling_profile": str(getattr(cfg, "LABELING_PROFILE", "default")),
@@ -79,7 +84,10 @@ def build_experiment_snapshot() -> dict:
             "barrier_max_pct": float(getattr(cfg, "BARRIER_MAX_PCT", 0.0)),
         },
         "training": {
-            "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
+            "model_profile": model_profile["name"],
+            "model_mode": model_profile["mode"],
+            "target_column": model_profile["target_column"],
+            "feature_profile": model_profile["feature_profile"],
             "feature_clip_enabled": bool(getattr(cfg, "ENABLE_FEATURE_CLIP", False)),
             "feature_clip_lower_q": float(getattr(cfg, "FEATURE_CLIP_LOWER_Q", 0.0)),
             "feature_clip_upper_q": float(getattr(cfg, "FEATURE_CLIP_UPPER_Q", 1.0)),
@@ -96,7 +104,17 @@ def parse_args():
         default=cfg.SYMBOLS,
         help="Symbols to load, for example ETH/USDT SOL/USDT.",
     )
-    parser.add_argument("--model-name", default="lightgbm_target", help="Base filename for saved artifacts.")
+    parser.add_argument(
+        "--model-profile",
+        choices=sorted(cfg.MODEL_PROFILES),
+        default=cfg.ACTIVE_MODEL_PROFILE,
+        help="Model specification controlling target, features, and default artifact name.",
+    )
+    parser.add_argument(
+        "--model-name",
+        default=None,
+        help="Override the artifact base filename defined by --model-profile.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--n-splits",
@@ -140,6 +158,10 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_model_profile(name: str) -> dict:
+    return {"name": name, **cfg.get_model_profile(name)}
+
+
 def format_timestamp(value):
     timestamp = pd.to_datetime(value, errors="coerce")
     if pd.isna(timestamp):
@@ -162,7 +184,7 @@ def build_timestamp_profile(values):
     }
 
 
-def build_symbol_row_profile(frame):
+def build_symbol_row_profile(frame, target_column=TARGET_COLUMN):
     if frame.empty or SYMBOL_COLUMN not in frame.columns:
         return {}
 
@@ -179,20 +201,32 @@ def build_symbol_row_profile(frame):
                     "last_timestamp": timestamp_profile["last"],
                 }
             )
-        if TARGET_COLUMN in symbol_frame.columns:
-            target_counts = symbol_frame[TARGET_COLUMN].value_counts(dropna=False).sort_index()
+        if target_column in symbol_frame.columns:
+            target_counts = symbol_frame[target_column].value_counts(dropna=False).sort_index()
             row["target_counts"] = {str(key): int(value) for key, value in target_counts.items()}
         profile[symbol_key] = row
     return profile
 
 
-def load_training_frame(db_path, symbols):
-    """Load dataset, filter events, keep only directional labels {-1, 1} → {0, 1}."""
+def load_training_frame(db_path, symbols, model_profile=None):
+    """Load the profile target and normalize it to the internal binary class."""
+    model_profile = model_profile or {
+        "name": getattr(cfg, "ACTIVE_MODEL_PROFILE", "dual_v1"),
+        **cfg.get_model_profile(),
+    }
+    source_target = str(model_profile["target_column"])
+    mode = str(model_profile["mode"])
+
     repository = HistoricalKlineRepository(db_path=db_path)
     dataset = repository.load_feature_dataset(symbols)
-    feature_table_row_counts_by_symbol = build_symbol_row_profile(dataset)
+    if source_target not in dataset.columns:
+        raise RuntimeError(
+            f"Dataset is missing target column '{source_target}' for model profile "
+            f"'{model_profile['name']}'. Re-run etl.py."
+        )
+    feature_table_row_counts_by_symbol = build_symbol_row_profile(dataset, source_target)
 
-    dataset = dataset.dropna(subset=[TIMESTAMP_COLUMN, TARGET_COLUMN]).sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
+    dataset = dataset.dropna(subset=[TIMESTAMP_COLUMN, source_target]).sort_values(TIMESTAMP_COLUMN).reset_index(drop=True)
     dataset.replace([np.inf, -np.inf], np.nan, inplace=True)
     required_non_null_rows = int(len(dataset))
 
@@ -207,28 +241,40 @@ def load_training_frame(db_path, symbols):
             before_rows,
         )
 
-    rows_before_filter_by_symbol = build_symbol_row_profile(dataset)
-
-    raw_labels = dataset[TARGET_COLUMN].astype(int)
-    unknown_labels = sorted(set(raw_labels.unique()) - {-1, 0, 1})
-    if unknown_labels:
-        raise ValueError(f"Unexpected labels in {TARGET_COLUMN}: {unknown_labels}")
-
+    rows_before_filter_by_symbol = build_symbol_row_profile(dataset, source_target)
     all_timestamps = np.sort(dataset[TIMESTAMP_COLUMN].dropna().unique())
+    raw_labels = dataset[source_target].astype(int)
 
-    directional_mask = dataset[TARGET_COLUMN].astype(int) != 0
-    excluded_non_directional_rows = int((~directional_mask).sum())
-    directional_rows_by_symbol = build_symbol_row_profile(dataset.loc[directional_mask])
-    dataset = dataset.loc[directional_mask].copy()
-    raw_directional_labels = dataset[TARGET_COLUMN].astype(int)
-    dataset[TARGET_COLUMN] = raw_directional_labels.map({-1: 0, 1: 1})
+    if mode == "dual":
+        unknown_labels = sorted(set(raw_labels.unique()) - {-1, 0, 1})
+        if unknown_labels:
+            raise ValueError(f"Unexpected labels in {source_target}: {unknown_labels}")
+        selected_mask = raw_labels != 0
+        excluded_rows = int((~selected_mask).sum())
+        selected_rows_by_symbol = build_symbol_row_profile(
+            dataset.loc[selected_mask],
+            source_target,
+        )
+        dataset = dataset.loc[selected_mask].copy()
+        dataset[TARGET_COLUMN] = dataset[source_target].astype(int).map(LABEL_TO_CLASS)
+    else:
+        unknown_labels = sorted(set(raw_labels.unique()) - {0, 1})
+        if unknown_labels:
+            raise ValueError(f"Unexpected labels in {source_target}: {unknown_labels}")
+        excluded_rows = 0
+        selected_rows_by_symbol = build_symbol_row_profile(dataset, source_target)
+        dataset[TARGET_COLUMN] = raw_labels
+
     dataset[SYMBOL_COLUMN] = dataset[SYMBOL_COLUMN].astype("category")
-    dataset.attrs["excluded_non_directional_rows"] = excluded_non_directional_rows
+    dataset.attrs["excluded_non_directional_rows"] = excluded_rows
+    dataset.attrs["model_profile"] = model_profile["name"]
+    dataset.attrs["model_mode"] = mode
+    dataset.attrs["source_target_column"] = source_target
     dataset.attrs["all_timestamps"] = all_timestamps
     dataset.attrs["all_timestamps_profile"] = build_timestamp_profile(all_timestamps)
     dataset.attrs["required_non_null_rows"] = required_non_null_rows
     dataset.attrs["rows_before_filter_by_symbol"] = rows_before_filter_by_symbol
-    dataset.attrs["directional_rows_by_symbol"] = directional_rows_by_symbol
+    dataset.attrs["directional_rows_by_symbol"] = selected_rows_by_symbol
     dataset.attrs["feature_table_row_counts_by_symbol"] = feature_table_row_counts_by_symbol
     return dataset
 
@@ -237,8 +283,10 @@ def load_training_frame(db_path, symbols):
 #  Feature selection & clipping
 # ═══════════════════════════════════════════════════════════════════════════
 
-def select_feature_columns(dataset):
-    request = MasterFeatureBuilder().resolve_request()
+def select_feature_columns(dataset, feature_profile=None):
+    if feature_profile is None:
+        feature_profile = cfg.get_model_profile()["feature_profile"]
+    request = MasterFeatureBuilder().resolve_request(feature_profile)
     profile_name = request.profile
     if dict(getattr(cfg, "FEATURE_PROFILES", {})).get(profile_name) == "__all__":
         raise RuntimeError(
@@ -643,7 +691,7 @@ def format_metric_for_log(value, decimals: int = 4) -> str:
     return f"{float(value):.{decimals}f}"
 
 
-def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
+def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None, model_mode="dual"):
     """
     Compute a full metrics dictionary from pre-assembled OOS vectors.
 
@@ -658,15 +706,16 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     y_proba = np.asarray(y_proba)
-    p_long = y_proba[:, 1]
+    p_positive = y_proba[:, 1]
     if n_rows is None:
         n_rows = len(y_true)
 
+    class_names = ["short", "long"] if model_mode == "dual" else ["no_signal", model_mode]
     report = classification_report(
         y_true,
         y_pred,
         labels=[0, 1],
-        target_names=["short", "long"],
+        target_names=class_names,
         output_dict=True,
         zero_division=0,
     )
@@ -682,18 +731,25 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
         }
     )
     probability_threshold_metrics = {}
-    p_short = y_proba[:, 0]
+    p_negative = y_proba[:, 0]
     y_true_series = pd.Series(y_true).reset_index(drop=True)
     for threshold in confidence_thresholds:
         threshold = float(threshold)
         signal = np.full(n_rows, -1, dtype=int)
-        signal[p_long >= threshold] = 1
-        signal[p_short >= threshold] = 0
+        signal[p_positive >= threshold] = 1
+        if model_mode == "dual":
+            signal[p_negative >= threshold] = 0
         mask = signal != -1
         selected = int(mask.sum())
         coverage = float(selected / n_rows) if n_rows else 0.0
-        long_signals = int((signal == 1).sum())
-        short_signals = int((signal == 0).sum())
+        positive_signals = int((signal == 1).sum())
+        negative_signals = int((signal == 0).sum())
+        long_signals = positive_signals if model_mode in {"dual", "long"} else 0
+        short_signals = (
+            negative_signals if model_mode == "dual"
+            else positive_signals if model_mode == "short"
+            else 0
+        )
         no_trade = int((signal == -1).sum())
 
         if selected == 0:
@@ -702,6 +758,8 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
                 "coverage": coverage,
                 "long_signals": long_signals,
                 "short_signals": short_signals,
+                "positive_signals": positive_signals,
+                "positive_class": "long" if model_mode == "dual" else model_mode,
                 "no_trade": no_trade,
                 "signal_accuracy": None,
                 "signal_balanced_accuracy": None,
@@ -710,6 +768,8 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
                 "signal_classification_report": None,
                 "long_precision": None,
                 "short_precision": None,
+                "positive_precision": None,
+                "positive_recall_all": 0.0,
                 "long_recall_all": 0.0,
                 "short_recall_all": 0.0,
             }
@@ -721,20 +781,34 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
             subset_y_true,
             subset_y_pred,
             labels=[0, 1],
-            target_names=["short", "long"],
+            target_names=class_names,
             output_dict=True,
             zero_division=0,
         )
-        long_tp = int(((signal == 1) & (y_true_series.values == 1)).sum())
-        short_tp = int(((signal == 0) & (y_true_series.values == 0)).sum())
-        total_true_long = int((y_true_series.values == 1).sum())
-        total_true_short = int((y_true_series.values == 0).sum())
+        positive_tp = int(((signal == 1) & (y_true_series.values == 1)).sum())
+        negative_tp = int(((signal == 0) & (y_true_series.values == 0)).sum())
+        total_positive = int((y_true_series.values == 1).sum())
+        total_negative = int((y_true_series.values == 0).sum())
+        long_tp = positive_tp if model_mode in {"dual", "long"} else 0
+        short_tp = negative_tp if model_mode == "dual" else positive_tp if model_mode == "short" else 0
+        positive_recall = positive_tp / total_positive if total_positive > 0 else 0.0
+        if model_mode == "dual":
+            long_recall = positive_recall
+            short_recall = negative_tp / total_negative if total_negative > 0 else 0.0
+        elif model_mode == "long":
+            long_recall = positive_recall
+            short_recall = 0.0
+        else:
+            long_recall = 0.0
+            short_recall = positive_recall
 
         probability_threshold_metrics[f"{threshold:.2f}"] = {
             "rows": selected,
             "coverage": coverage,
             "long_signals": long_signals,
             "short_signals": short_signals,
+            "positive_signals": positive_signals,
+            "positive_class": "long" if model_mode == "dual" else model_mode,
             "no_trade": no_trade,
             "signal_accuracy": float(accuracy_score(subset_y_true, subset_y_pred)),
             "signal_balanced_accuracy": float(balanced_accuracy_score(subset_y_true, subset_y_pred)),
@@ -743,16 +817,18 @@ def evaluate_model(y_true, y_pred, y_proba, split_name, n_rows=None):
             "signal_classification_report": subset_report,
             "long_precision": float(long_tp / long_signals) if long_signals > 0 else None,
             "short_precision": float(short_tp / short_signals) if short_signals > 0 else None,
-            "long_recall_all": float(long_tp / total_true_long) if total_true_long > 0 else 0.0,
-            "short_recall_all": float(short_tp / total_true_short) if total_true_short > 0 else 0.0,
+            "positive_precision": float(positive_tp / positive_signals) if positive_signals > 0 else None,
+            "positive_recall_all": float(positive_recall),
+            "long_recall_all": float(long_recall),
+            "short_recall_all": float(short_recall),
         }
 
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
-        "roc_auc": safe_roc_auc(y_true, p_long),
-        "pr_auc": safe_pr_auc(y_true, p_long),
+        "roc_auc": safe_roc_auc(y_true, p_positive),
+        "pr_auc": safe_pr_auc(y_true, p_positive),
         "mcc": float(matthews_corrcoef(y_true, y_pred)),
         "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
         "classification_report": report,
@@ -1053,6 +1129,7 @@ def walk_forward_validation(
         y_proba=oos_y_proba,
         split_name="oos",
         n_rows=len(oos_y_true),
+        model_mode=str(dataset.attrs.get("model_mode", "dual")),
     )
 
     median_best_iter = int(np.median(best_iterations))
@@ -1212,6 +1289,9 @@ def build_dataset_diagnostics(dataset, fold_details):
     excluded_non_directional_rows = int(dataset.attrs.get("excluded_non_directional_rows", 0))
 
     return {
+        "model_profile": dataset.attrs.get("model_profile"),
+        "model_mode": dataset.attrs.get("model_mode"),
+        "source_target_column": dataset.attrs.get("source_target_column"),
         "all_timestamps_count": int(all_timestamp_profile["count"]),
         "first_all_timestamp": all_timestamp_profile["first"],
         "last_all_timestamp": all_timestamp_profile["last"],
@@ -1295,6 +1375,9 @@ def build_train_history_entry(args, metrics, experiment_snapshot):
     return {
         "run_timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "model_name": args.model_name,
+        "model_profile": args.model_profile,
+        "model_mode": metrics.get("model_mode"),
+        "target_column": metrics.get("source_target_column"),
         "experiment": experiment_snapshot["experiment"],
         "labeling_profile": experiment_snapshot["labeling_profile"],
         "training_profile": experiment_snapshot["training_profile"],
@@ -1511,6 +1594,18 @@ def build_feature_formulas_payload(feature_columns, model_name, symbols, experim
     }
 
 
+def build_model_label_metadata(model_profile: dict) -> dict:
+    if model_profile["mode"] == "dual":
+        return {
+            "label_mapping": {"short": 0, "long": 1},
+            "inverse_label_mapping": {str(key): value for key, value in CLASS_TO_LABEL.items()},
+        }
+    return {
+        "label_mapping": {"no_signal": 0, model_profile["mode"]: 1},
+        "positive_label": int(model_profile.get("positive_label", 1)),
+    }
+
+
 def save_directional_artifacts(
     model,
     metrics,
@@ -1531,14 +1626,17 @@ def save_directional_artifacts(
     feature_formulas_path = cfg.MODELS_DIR / f"{args.model_name}_feature_formulas.json"
     artifact_paths = [model_path, metrics_path, features_path, importance_path, fold_importance_path, feature_formulas_path]
 
+    model_profile = resolve_model_profile(args.model_profile)
     payload = {
         "feature_columns": feature_columns,
-        "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
-        "label_mapping": {"short": 0, "long": 1},
-        "inverse_label_mapping": {str(key): value for key, value in CLASS_TO_LABEL.items()},
+        "model_profile": model_profile["name"],
+        "model_mode": model_profile["mode"],
+        "target_column": model_profile["target_column"],
+        "feature_profile": model_profile["feature_profile"],
+        **build_model_label_metadata(model_profile),
         "symbols": list(args.symbols),
         "rows": int(len(dataset)),
-        "task_type": "binary_directional",
+        "task_type": f"binary_{model_profile['mode']}",
         "train_period": build_period_payload(dataset),
         "wfv_n_splits": args.n_splits,
         "wfv_purge_gap": args.purge_gap,
@@ -1606,12 +1704,25 @@ def backup_existing_artifacts(paths, model_name):
 def main():
     try:
         args = parse_args()
-        experiment_snapshot = build_experiment_snapshot()
-        dataset = load_training_frame(args.db_path, args.symbols)
-        feature_columns = select_feature_columns(dataset)
+        model_profile = resolve_model_profile(args.model_profile)
+        if args.model_name is None:
+            args.model_name = model_profile["artifact_name"]
+        experiment_snapshot = build_experiment_snapshot(model_profile)
+        dataset = load_training_frame(args.db_path, args.symbols, model_profile)
+        feature_columns = select_feature_columns(
+            dataset,
+            model_profile["feature_profile"],
+        )
 
         logger.info("Loaded %s rows with %s features", len(dataset), len(feature_columns))
         logger.info("Using symbols: %s", ", ".join(args.symbols))
+        logger.info(
+            "Model profile=%s | mode=%s | target=%s | artifact=%s",
+            model_profile["name"],
+            model_profile["mode"],
+            model_profile["target_column"],
+            args.model_name,
+        )
         logger.info(
             "Experiment=%s | labeling_profile=%s | training_profile=%s",
             experiment_snapshot["experiment"],
@@ -1633,10 +1744,17 @@ def main():
             experiment_snapshot["training"]["feature_clip_lower_q"] * 100,
             experiment_snapshot["training"]["feature_clip_upper_q"] * 100,
         )
-        logger.info(
-            "Directional dataset: excluded %s non-directional rows with Target=0 before split",
-            int(dataset.attrs.get("excluded_non_directional_rows", 0)),
-        )
+        if model_profile["mode"] == "dual":
+            logger.info(
+                "Dual dataset: excluded %s rows with Target=0 before split",
+                int(dataset.attrs.get("excluded_non_directional_rows", 0)),
+            )
+        else:
+            logger.info(
+                "%s dataset: retained all rows; positive rate=%.4f",
+                model_profile["mode"].capitalize(),
+                float(dataset[TARGET_COLUMN].mean()),
+            )
         timeline_profile = dataset.attrs.get("all_timestamps_profile", {})
         logger.info(
             "Dataset timeline | all_timestamps=%s [%s -> %s] | rows before label filter=%s | directional=%s",
@@ -1693,6 +1811,10 @@ def main():
 
         # ── Step 3: Assemble final metrics payload & persist ─────────────
         metrics = {
+            "model_profile": model_profile["name"],
+            "model_mode": model_profile["mode"],
+            "source_target_column": model_profile["target_column"],
+            "feature_profile": model_profile["feature_profile"],
             "oos_metrics": oos_metrics,
             "fold_details": fold_details,
             "fold_stability": build_fold_stability_payload(fold_details),

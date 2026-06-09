@@ -31,6 +31,9 @@ DUAL_V1_FEATURES = [
 # evolve separately without changing the existing dual model.
 LONG_V1_FEATURES = [*DUAL_V1_FEATURES]
 SHORT_V1_FEATURES = [*DUAL_V1_FEATURES]
+MODEL_UNION_V1_FEATURES = sorted(
+    set(DUAL_V1_FEATURES) | set(LONG_V1_FEATURES) | set(SHORT_V1_FEATURES)
+)
 
 FEATURE_PROFILES = {
     "all": "__all__",
@@ -38,6 +41,7 @@ FEATURE_PROFILES = {
     "dual_v1": DUAL_V1_FEATURES,
     "long_v1": LONG_V1_FEATURES,
     "short_v1": SHORT_V1_FEATURES,
+    "model_union_v1": MODEL_UNION_V1_FEATURES,
     "base_only": [
         "realized_vol_1h",
         "ema_fast_slow",
@@ -108,7 +112,7 @@ def get_model_profile(name: str = ACTIVE_MODEL_PROFILE) -> dict:
 
 
 FEATURE_BUILD_REQUEST = {
-    "profile": get_model_profile()["feature_profile"],
+    "profile": "model_union_v1",
     "include_features": [],
     "exclude_features": [],
     "exclude_blocks": [],

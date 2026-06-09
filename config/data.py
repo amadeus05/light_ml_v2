@@ -8,8 +8,6 @@ SYMBOLS = [
     "BNB/USDT",
     "ETH/USDT",
     "SOL/USDT",
-    "XRP/USDT",
-    "ADA/USDT",
 ]
 
 TIMEFRAME = "1h"

@@ -21,6 +21,7 @@ ANSI_RESET = "\033[0m"
 
 BASE_OUTPUT_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 BARRIER_OUTPUT_COLUMNS = ["barrier_stop_pct", "barrier_take_pct"]
+TARGET_OUTPUT_COLUMNS = ["Target", "TargetLong", "TargetShort"]
 
 
 def get_base_horizon() -> int:
@@ -200,6 +201,8 @@ def simulate_trade_outcome(
 
 def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
     labels = []
+    long_labels = []
+    short_labels = []
     effective_horizons = compute_effective_horizons(df)
     max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon()
 
@@ -214,6 +217,8 @@ def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
         horizon = int(effective_horizons[i]) if i < len(effective_horizons) else get_base_horizon()
         long_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=1, horizon=horizon)
         short_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=-1, horizon=horizon)
+        long_labels.append(int(long_pnl > 0))
+        short_labels.append(int(short_pnl > 0))
 
         if long_pnl > 0 and short_pnl <= 0:
             label = 1
@@ -223,8 +228,12 @@ def triple_barrier_labeling(df: pd.DataFrame) -> pd.DataFrame:
         labels.append(label)
 
     labels.extend([0] * max_horizon)
+    long_labels.extend([0] * max_horizon)
+    short_labels.extend([0] * max_horizon)
     output = df.copy()
     output["Target"] = labels
+    output["TargetLong"] = long_labels
+    output["TargetShort"] = short_labels
     return output
 
 
@@ -236,7 +245,7 @@ def finalize_feature_frame(df: pd.DataFrame, feature_columns: list[str]) -> pd.D
     horizon_dropped_rows = min(max_horizon, len(output)) if max_horizon > 0 else 0
     if max_horizon > 0:
         if len(output) <= max_horizon:
-            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + ["Target"]
+            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
             logger.warning(
                 "Feature finalize removed all rows: input_rows=%s max_horizon=%s output_rows=0",
                 input_rows,
@@ -245,7 +254,7 @@ def finalize_feature_frame(df: pd.DataFrame, feature_columns: list[str]) -> pd.D
             return output.iloc[0:0][empty_columns].copy()
         output = output.iloc[:-max_horizon].copy()
 
-    output_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + ["Target"]
+    output_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
     for column in output_columns:
         if column not in output.columns:
             output[column] = np.nan

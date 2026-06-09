@@ -117,9 +117,16 @@ class MasterFeatureBuilder:
     def _resolve_request(self) -> ResolvedFeatureRequest:
         return self.resolve_request()
 
-    def resolve_request(self) -> ResolvedFeatureRequest:
+    def resolve_request(self, profile_name: str | None = None) -> ResolvedFeatureRequest:
         block_features = self._collect_block_features()
-        raw_request = getattr(cfg, "FEATURE_BUILD_REQUEST", {})
+        raw_request = dict(getattr(cfg, "FEATURE_BUILD_REQUEST", {}))
+        if profile_name is not None:
+            raw_request = {
+                "profile": profile_name,
+                "include_features": [],
+                "exclude_features": [],
+                "exclude_blocks": [],
+            }
         profile_map = getattr(cfg, "FEATURE_PROFILES", {})
         return resolve_feature_request(raw_request, profile_map, block_features)
 
