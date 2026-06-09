@@ -79,7 +79,7 @@ def build_experiment_snapshot() -> dict:
             "barrier_max_pct": float(getattr(cfg, "BARRIER_MAX_PCT", 0.0)),
         },
         "training": {
-            "disabled_feature_columns": sorted(getattr(cfg, "MANUAL_DISABLED_FEATURE_COLUMNS", [])),
+            "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
             "feature_clip_enabled": bool(getattr(cfg, "ENABLE_FEATURE_CLIP", False)),
             "feature_clip_lower_q": float(getattr(cfg, "FEATURE_CLIP_LOWER_Q", 0.0)),
             "feature_clip_upper_q": float(getattr(cfg, "FEATURE_CLIP_UPPER_Q", 1.0)),
@@ -238,34 +238,50 @@ def load_training_frame(db_path, symbols):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def select_feature_columns(dataset):
-    feature_columns = []
-    use_symbol_feature = bool(getattr(cfg, "USE_SYMBOL_FEATURE", True))
-    disabled_feature_columns = set(getattr(cfg, "MANUAL_DISABLED_FEATURE_COLUMNS", []))
+    request = MasterFeatureBuilder().resolve_request()
+    profile_name = request.profile
+    if dict(getattr(cfg, "FEATURE_PROFILES", {})).get(profile_name) == "__all__":
+        raise RuntimeError(
+            "Training requires an explicit feature whitelist; profile 'all' is not allowed."
+        )
 
-    for column in dataset.columns:
-        if column in RESERVED_COLUMNS:
-            continue
-        if column in EXCLUDED_RAW_FEATURE_COLUMNS:
-            continue
-        if column in disabled_feature_columns:
-            continue
-        if column == SYMBOL_COLUMN:
-            if use_symbol_feature:
-                feature_columns.append(column)
-            continue
-        if pd.api.types.is_numeric_dtype(dataset[column]):
-            feature_columns.append(column)
+    feature_columns = list(request.active_features)
+
+    use_symbol_feature = bool(getattr(cfg, "USE_SYMBOL_FEATURE", True))
+    if use_symbol_feature and SYMBOL_COLUMN not in feature_columns:
+        feature_columns.append(SYMBOL_COLUMN)
+
+    invalid_reserved = sorted(set(feature_columns).intersection(RESERVED_COLUMNS | EXCLUDED_RAW_FEATURE_COLUMNS))
+    if invalid_reserved:
+        raise RuntimeError(
+            "Feature profile contains reserved/raw columns: " + ", ".join(invalid_reserved)
+        )
+
+    missing_columns = sorted(set(feature_columns) - set(dataset.columns))
+    if missing_columns:
+        raise RuntimeError(
+            f"Feature profile '{profile_name}' is missing columns in the dataset: "
+            + ", ".join(missing_columns)
+            + ". Re-run etl.py with the same profile."
+        )
+
+    non_numeric_columns = [
+        column
+        for column in feature_columns
+        if column != SYMBOL_COLUMN and not pd.api.types.is_numeric_dtype(dataset[column])
+    ]
+    if non_numeric_columns:
+        raise RuntimeError(
+            "Feature profile contains non-numeric columns: " + ", ".join(non_numeric_columns)
+        )
 
     if not feature_columns:
         raise RuntimeError("No usable feature columns found in the dataset.")
-    if disabled_feature_columns:
-        disabled_present = sorted(disabled_feature_columns.intersection(dataset.columns))
-        if disabled_present:
-            logger.info(
-                "Config disabled %s feature columns, excluding them from training: %s",
-                len(disabled_present),
-                ", ".join(disabled_present),
-            )
+    logger.info(
+        "Using explicit feature profile '%s' with %s model features",
+        profile_name,
+        len(feature_columns),
+    )
     return feature_columns
 
 
@@ -1517,6 +1533,7 @@ def save_directional_artifacts(
 
     payload = {
         "feature_columns": feature_columns,
+        "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
         "label_mapping": {"short": 0, "long": 1},
         "inverse_label_mapping": {str(key): value for key, value in CLASS_TO_LABEL.items()},
         "symbols": list(args.symbols),
@@ -1610,8 +1627,8 @@ def main():
             experiment_snapshot["labeling"]["barrier_tp_to_sl_ratio"],
         )
         logger.info(
-            "Training config: disabled_features=%s | clip=%s [%.2f%%, %.2f%%]",
-            len(experiment_snapshot["training"]["disabled_feature_columns"]),
+            "Training config: feature_profile=%s | clip=%s [%.2f%%, %.2f%%]",
+            experiment_snapshot["training"]["feature_profile"],
             experiment_snapshot["training"]["feature_clip_enabled"],
             experiment_snapshot["training"]["feature_clip_lower_q"] * 100,
             experiment_snapshot["training"]["feature_clip_upper_q"] * 100,

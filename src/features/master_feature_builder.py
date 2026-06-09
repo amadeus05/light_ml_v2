@@ -58,8 +58,12 @@ class MasterFeatureBuilder:
         htf_candle_map: dict[str, pd.DataFrame],
     ) -> FeaturePipelineResult:
         request = self._resolve_request()
-        requested_features = set(request.active_features)
-        requested_feature_specs = self.collect_feature_specs(requested_features)
+        model_features = set(request.active_features)
+        pipeline_features = set(getattr(cfg, "FEATURE_PIPELINE_REQUIRED_FEATURES", []))
+        requested_features = self.expand_feature_dependencies(
+            model_features | pipeline_features
+        )
+        requested_feature_specs = self.collect_feature_specs(model_features)
 
         base_feature_map = self._build_symbol_map(
             candle_map=base_candle_map,
@@ -96,16 +100,24 @@ class MasterFeatureBuilder:
             feature_map=merged_feature_map,
             requested_features=requested_features,
         )
+        active_blocks = tuple(
+            builder.block_name
+            for builder in self._all_builders()
+            if builder.provides().intersection(requested_features)
+        )
 
         return FeaturePipelineResult(
             feature_map=final_feature_map,
-            feature_columns=tuple(sorted(requested_features)),
-            active_blocks=request.active_blocks,
+            feature_columns=tuple(sorted(model_features)),
+            active_blocks=active_blocks,
             profile_name=request.profile,
             feature_specs=requested_feature_specs,
         )
 
     def _resolve_request(self) -> ResolvedFeatureRequest:
+        return self.resolve_request()
+
+    def resolve_request(self) -> ResolvedFeatureRequest:
         block_features = self._collect_block_features()
         raw_request = getattr(cfg, "FEATURE_BUILD_REQUEST", {})
         profile_map = getattr(cfg, "FEATURE_PROFILES", {})
@@ -128,6 +140,29 @@ class MasterFeatureBuilder:
                 )
             feature_specs.update(builder_specs)
         return feature_specs
+
+    def expand_feature_dependencies(self, requested_features: set[str]) -> set[str]:
+        feature_specs = self.collect_feature_specs()
+        unknown_features = sorted(requested_features - set(feature_specs))
+        if unknown_features:
+            raise ValueError(
+                "Unknown requested features: " + ", ".join(unknown_features)
+            )
+
+        resolved = set(requested_features)
+        pending = list(requested_features)
+        while pending:
+            feature_name = pending.pop()
+            for dependency in feature_specs[feature_name].dependencies:
+                if dependency not in feature_specs:
+                    raise ValueError(
+                        f"Feature '{feature_name}' has unknown dependency '{dependency}'."
+                    )
+                if dependency in resolved:
+                    continue
+                resolved.add(dependency)
+                pending.append(dependency)
+        return resolved
 
     def _all_builders(self) -> list[FeatureBuilderContract]:
         return [

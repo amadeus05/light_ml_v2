@@ -356,6 +356,7 @@ def build_features_meta(
 ):
     return {
         "feature_columns": feature_columns,
+        "feature_profile": str(getattr(cfg, "FEATURE_BUILD_REQUEST", {}).get("profile", "")),
         "label_mapping": {"short": 0, "long": 1},
         "inverse_label_mapping": {str(key): value for key, value in train.CLASS_TO_LABEL.items()},
         "symbols": list(symbols),
