@@ -108,6 +108,7 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
             "timeframe_profile": model_profile["timeframe_profile"],
             "timeframe": timeframe_profile["timeframe"],
             "htf_timeframe": timeframe_profile["htf_timeframe"],
+            "htf_timeframes": list(timeframe_profile["htf_timeframes"]),
             "target_column": model_profile["target_column"],
             "feature_profile": model_profile["feature_profile"],
             "feature_clip_enabled": bool(getattr(cfg, "ENABLE_FEATURE_CLIP", False)),
@@ -303,6 +304,7 @@ def load_training_frame(db_path, symbols, model_profile=None):
     dataset.attrs["timeframe_profile"] = model_profile["timeframe_profile"]
     dataset.attrs["timeframe"] = timeframe
     dataset.attrs["htf_timeframe"] = timeframe_profile["htf_timeframe"]
+    dataset.attrs["htf_timeframes"] = list(timeframe_profile["htf_timeframes"])
     dataset.attrs["source_target_column"] = source_target
     dataset.attrs["all_timestamps"] = all_timestamps
     dataset.attrs["all_timestamps_profile"] = build_timestamp_profile(all_timestamps)
@@ -1675,6 +1677,7 @@ def save_directional_artifacts(
         "timeframe_profile": model_profile["timeframe_profile"],
         "timeframe": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["timeframe"],
         "htf_timeframe": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["htf_timeframe"],
+        "htf_timeframes": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["htf_timeframes"],
         "target_column": model_profile["target_column"],
         "feature_profile": model_profile["feature_profile"],
         "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),

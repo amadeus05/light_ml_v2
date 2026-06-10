@@ -410,6 +410,7 @@ def build_labeling_snapshot(timeframe_profile: dict | None = None) -> dict:
         "timeframe_profile": timeframe_profile["name"],
         "timeframe": timeframe,
         "htf_timeframe": timeframe_profile["htf_timeframe"],
+        "htf_timeframes": list(timeframe_profile["htf_timeframes"]),
         "horizon": get_base_horizon(timeframe),
         "horizon_duration": str(getattr(cfg, "HORIZON_DURATION", "12h")),
         "use_dynamic_barriers": bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", False)),
@@ -618,6 +619,7 @@ def main() -> None:
     timeframe_profile = cfg.get_timeframe_profile(args.timeframe_profile)
     timeframe = timeframe_profile["timeframe"]
     htf_timeframe = timeframe_profile["htf_timeframe"]
+    htf_timeframes = timeframe_profile["htf_timeframes"]
     exchange_service = create_exchange_service()
     repository = HistoricalKlineRepository(exchange_code=exchange_service.get_exchange_code())
     repository.init_schema()
@@ -630,7 +632,7 @@ def main() -> None:
         labeling_snapshot["training_profile"],
         labeling_snapshot["timeframe_profile"],
         timeframe,
-        htf_timeframe,
+        ", ".join(htf_timeframes),
     )
     logger.info(
         "ETL labeling config: horizon=%s | dynamic_barriers=%s | stop[min=%.4f max=%.4f] | tp/sl=%.2f",
@@ -661,10 +663,22 @@ def main() -> None:
         logger.info("%s %s: %s new candles", symbol_name, timeframe, loaded)
         warn_if_history_starts_late(repository, symbol_name, timeframe, start_date)
 
-        logger.info("Loading %s %s from %s...", symbol_name, htf_timeframe, start_date)
-        htf_loaded = repository.sync_candles(exchange_service, symbol, htf_timeframe, start_date, end_date)
-        logger.info("%s %s: %s new candles", symbol_name, htf_timeframe, htf_loaded)
-        warn_if_history_starts_late(repository, symbol_name, htf_timeframe, start_date)
+        for current_htf in htf_timeframes:
+            logger.info("Loading %s %s from %s...", symbol_name, current_htf, start_date)
+            htf_loaded = repository.sync_candles(
+                exchange_service,
+                symbol,
+                current_htf,
+                start_date,
+                end_date,
+            )
+            logger.info("%s %s: %s new candles", symbol_name, current_htf, htf_loaded)
+            warn_if_history_starts_late(
+                repository,
+                symbol_name,
+                current_htf,
+                start_date,
+            )
 
         logger.info("Loading %s funding from %s...", symbol_name, start_date)
         funding_loaded = repository.sync_funding_rates(exchange_service, symbol, start_date, end_date)

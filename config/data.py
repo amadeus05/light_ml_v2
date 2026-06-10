@@ -10,8 +10,10 @@ SYMBOLS = [
     "SOL/USDT",
 ]
 
-TIMEFRAME = "1h"
-HTF_TIMEFRAME = "4h"
+TIMEFRAME = "15m"
+# The first timeframe is used for existing HTF features. All listed
+# timeframes are downloaded by ETL.
+HTF_TIMEFRAME = "1h,4h"
 
 ACTIVE_EXCHANGE = "bybit"
 
