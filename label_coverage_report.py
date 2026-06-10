@@ -11,6 +11,7 @@ import config as cfg
 import train
 from label_coverage_report_template import LABEL_COVERAGE_HTML_TEMPLATE
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
+from src.timeframes import duration_to_bars
 
 
 TARGET_VALUES = (-1, 0, 1)
@@ -23,16 +24,30 @@ def parse_args():
     parser.add_argument("--db-path", default=cfg.DB_PATH, help="Path to SQLite database.")
     parser.add_argument("--symbols", nargs="+", default=cfg.SYMBOLS, help="Symbols to inspect.")
     parser.add_argument(
-        "--timeframe-profile",
-        choices=sorted(cfg.TIMEFRAME_PROFILES),
-        default=cfg.ACTIVE_TIMEFRAME_PROFILE,
+        "--model-profile",
+        choices=sorted(cfg.MODEL_PROFILES),
+        default=None,
+        help="Model profile controlling timeframe, target column, and label semantics.",
     )
     parser.add_argument(
+        "--timeframe-profile",
+        choices=sorted(cfg.TIMEFRAME_PROFILES),
+        default=None,
+        help="Backward-compatible shortcut selecting the matching dual model profile.",
+    )
+    sequence_group = parser.add_mutually_exclusive_group()
+    sequence_group.add_argument(
+        "--sequence-durations",
+        nargs="+",
+        default=None,
+        help="Physical sequence durations, for example 12h 24h 48h.",
+    )
+    sequence_group.add_argument(
         "--sequence-lengths",
         nargs="+",
         type=int,
-        default=default_sequence_lengths(),
-        help="Sequence lengths to estimate eligible directional samples for LSTM-style datasets.",
+        default=None,
+        help="Legacy sequence lengths expressed directly in bars.",
     )
     parser.add_argument(
         "--min-directional-rows",
@@ -53,8 +68,8 @@ def parse_args():
     )
     parser.add_argument(
         "--html-output",
-        default=str(cfg.MODELS_DIR / "label_coverage_report.html"),
-        help="Path to write the HTML report.",
+        default=None,
+        help="Path to write the HTML report. Defaults to a model-profile-specific filename.",
     )
     return parser.parse_args()
 
@@ -76,15 +91,109 @@ def default_sequence_lengths() -> list[int]:
     return sorted(set(length for length in lengths if length > 0)) or [48, 64]
 
 
+def resolve_report_profile(
+    model_profile_name: str | None = None,
+    timeframe_profile_name: str | None = None,
+) -> dict:
+    if model_profile_name is not None:
+        profile = {"name": model_profile_name, **cfg.get_model_profile(model_profile_name)}
+        if (
+            timeframe_profile_name is not None
+            and profile["timeframe_profile"] != timeframe_profile_name
+        ):
+            raise ValueError(
+                f"Model profile '{model_profile_name}' uses timeframe profile "
+                f"'{profile['timeframe_profile']}', not '{timeframe_profile_name}'."
+            )
+    elif timeframe_profile_name is not None:
+        matches = [
+            name
+            for name, candidate in cfg.MODEL_PROFILES.items()
+            if candidate["timeframe_profile"] == timeframe_profile_name
+            and candidate["mode"] == "dual"
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Timeframe profile '{timeframe_profile_name}' does not have exactly "
+                "one dual model profile."
+            )
+        profile = {"name": matches[0], **cfg.get_model_profile(matches[0])}
+    else:
+        active_name = cfg.ACTIVE_MODEL_PROFILE
+        profile = {"name": active_name, **cfg.get_model_profile(active_name)}
+
+    if profile["mode"] not in {"dual", "long", "short"}:
+        raise ValueError(
+            f"Model profile '{profile['name']}' has unsupported mode "
+            f"'{profile['mode']}'."
+        )
+
+    timeframe_profile = cfg.get_timeframe_profile(profile["timeframe_profile"])
+    return {
+        **profile,
+        "timeframe": timeframe_profile["timeframe"],
+        "htf_timeframe": timeframe_profile["htf_timeframe"],
+    }
+
+
+def resolve_sequence_windows(
+    sequence_durations: list[str] | None,
+    sequence_lengths: list[int] | None,
+    timeframe: str,
+) -> list[tuple[str, int]]:
+    if sequence_lengths is not None:
+        invalid = [length for length in sequence_lengths if int(length) <= 0]
+        if invalid:
+            raise ValueError(f"Sequence lengths must be positive: {invalid}")
+        candidates = [
+            (f"{int(length)}bars", int(length))
+            for length in sequence_lengths
+        ]
+    else:
+        durations = sequence_durations
+        if durations is None:
+            durations = [f"{length}h" for length in default_sequence_lengths()]
+
+        candidates = []
+        for duration in durations:
+            normalized_duration = str(duration).strip()
+            if not normalized_duration:
+                raise ValueError("Sequence duration cannot be empty.")
+            candidates.append(
+                (
+                    normalized_duration,
+                    duration_to_bars(normalized_duration, timeframe),
+                )
+            )
+
+    windows = list(dict.fromkeys(candidates))
+    if not windows:
+        raise ValueError("At least one sequence window is required.")
+    return windows
+
+
 def load_target_frame(
     db_path: str,
     symbols: list[str],
-    timeframe_profile: str = cfg.ACTIVE_TIMEFRAME_PROFILE,
+    report_profile: dict | str | None = None,
 ) -> pd.DataFrame:
+    if isinstance(report_profile, str):
+        report_profile = resolve_report_profile(timeframe_profile_name=report_profile)
+    report_profile = report_profile or resolve_report_profile()
     repository = HistoricalKlineRepository(db_path=db_path)
-    timeframe = cfg.get_timeframe_profile(timeframe_profile)["timeframe"]
+    timeframe = report_profile["timeframe"]
     frame = repository.load_feature_dataset(symbols, timeframe=timeframe)
-    frame = frame.dropna(subset=[train.TIMESTAMP_COLUMN, train.SYMBOL_COLUMN, train.TARGET_COLUMN]).copy()
+    source_target = report_profile["target_column"]
+    if source_target not in frame.columns:
+        raise RuntimeError(
+            f"Feature dataset for '{report_profile['name']}' is missing target "
+            f"column '{source_target}'. Re-run etl.py for "
+            f"'{report_profile['timeframe_profile']}'."
+        )
+
+    frame = frame.dropna(
+        subset=[train.TIMESTAMP_COLUMN, train.SYMBOL_COLUMN, source_target]
+    ).copy()
     frame[train.TIMESTAMP_COLUMN] = pd.to_datetime(frame[train.TIMESTAMP_COLUMN], errors="coerce")
     frame = frame.dropna(subset=[train.TIMESTAMP_COLUMN])
 
@@ -92,10 +201,40 @@ def load_target_frame(
     if end_cutoff is not None and not pd.isna(end_cutoff):
         frame = frame.loc[frame[train.TIMESTAMP_COLUMN] <= end_cutoff].copy()
 
-    frame[train.TARGET_COLUMN] = frame[train.TARGET_COLUMN].astype(int)
+    source_values = pd.to_numeric(frame[source_target], errors="raise")
+    source_array = source_values.to_numpy(dtype=float)
+    if not np.isfinite(source_array).all():
+        raise ValueError(f"{source_target} contains non-finite values.")
+    rounded_source = np.rint(source_array)
+    if not np.array_equal(source_array, rounded_source):
+        invalid_values = sorted(set(source_values[source_array != rounded_source].tolist()))
+        raise ValueError(
+            f"{source_target} must contain integer labels; found: {invalid_values}"
+        )
+    source_labels = pd.Series(
+        rounded_source.astype(int),
+        index=frame.index,
+        name=source_target,
+    )
+    mode = report_profile["mode"]
+    if mode == "dual":
+        allowed_source_values = {-1, 0, 1}
+        frame[train.TARGET_COLUMN] = source_labels
+    elif mode == "long":
+        allowed_source_values = {0, 1}
+        frame[train.TARGET_COLUMN] = source_labels
+    elif mode == "short":
+        allowed_source_values = {0, 1}
+        frame[train.TARGET_COLUMN] = -source_labels
+    else:
+        raise ValueError(f"Unsupported model mode: {mode}")
+
+    unknown_source = sorted(set(source_labels.unique()) - allowed_source_values)
+    if unknown_source:
+        raise ValueError(f"Unexpected values in {source_target}: {unknown_source}")
     unknown = sorted(set(frame[train.TARGET_COLUMN].unique()) - set(TARGET_VALUES))
     if unknown:
-        raise ValueError(f"Unexpected Target values: {unknown}")
+        raise ValueError(f"Unexpected values in {source_target}: {unknown}")
     return frame.sort_values([train.SYMBOL_COLUMN, train.TIMESTAMP_COLUMN]).reset_index(drop=True)
 
 
@@ -161,7 +300,16 @@ def build_target_summary(frame: pd.DataFrame, group_columns: Iterable[str] = ())
     return pd.DataFrame(rows)[columns]
 
 
-def estimate_sequence_samples(frame: pd.DataFrame, sequence_lengths: list[int]) -> pd.DataFrame:
+def estimate_sequence_samples(
+    frame: pd.DataFrame,
+    sequence_windows: list[int] | list[tuple[str, int]],
+) -> pd.DataFrame:
+    normalized_windows = [
+        (f"{int(window)}bars", int(window))
+        if isinstance(window, (int, np.integer))
+        else (str(window[0]), int(window[1]))
+        for window in sequence_windows
+    ]
     rows = []
     for symbol, symbol_frame in frame.groupby(train.SYMBOL_COLUMN, observed=True):
         symbol_frame = symbol_frame.sort_values(train.TIMESTAMP_COLUMN).reset_index(drop=True)
@@ -172,24 +320,68 @@ def estimate_sequence_samples(frame: pd.DataFrame, sequence_lengths: list[int]) 
             "rows": int(len(symbol_frame)),
             "directional": int(directional_mask.sum()),
         }
-        for length in sequence_lengths:
-            length = int(length)
-            eligible = int((directional_positions >= max(0, length - 1)).sum())
-            row[f"seq_{length}_eligible"] = eligible
+        for label, bars in normalized_windows:
+            eligible = int((directional_positions >= max(0, bars - 1)).sum())
+            row[f"seq_{label}_{bars}bars_eligible"] = eligible
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def print_config_snapshot() -> None:
+def label_semantics(report_profile: dict) -> dict:
+    mode = report_profile["mode"]
+    if mode == "dual":
+        return {
+            "signal_name": "Directional",
+            "signal_description": "Target != 0",
+            "negative_name": "Short",
+            "neutral_name": "Neutral",
+            "positive_name": "Long",
+        }
+    if mode == "long":
+        return {
+            "signal_name": "Long-positive",
+            "signal_description": "TargetLong = 1",
+            "negative_name": "Short (not modeled)",
+            "neutral_name": "No signal",
+            "positive_name": "Long",
+        }
+    return {
+        "signal_name": "Short-positive",
+        "signal_description": "TargetShort = 1",
+        "negative_name": "Short",
+        "neutral_name": "No signal",
+        "positive_name": "Long (not modeled)",
+    }
+
+
+def print_config_snapshot(
+    report_profile: dict | None = None,
+    sequence_windows: list[tuple[str, int]] | None = None,
+) -> None:
+    report_profile = report_profile or resolve_report_profile()
+    timeframe = report_profile["timeframe"]
+    horizon_duration = str(getattr(cfg, "HORIZON_DURATION", "12h"))
+    horizon_bars = duration_to_bars(horizon_duration, timeframe)
+    min_duration = str(getattr(cfg, "ADAPTIVE_HORIZON_MIN_DURATION", "8h"))
+    max_duration = str(getattr(cfg, "ADAPTIVE_HORIZON_MAX_DURATION", "20h"))
     print("Labeling config:")
-    print(f"  HORIZON={int(getattr(cfg, 'HORIZON', 0))}")
+    print(f"  MODEL_PROFILE={report_profile['name']}")
+    print(f"  TARGET={report_profile['target_column']}")
+    print(f"  TIMEFRAME={timeframe} | HTF={report_profile['htf_timeframe']}")
+    print(f"  HORIZON={horizon_duration} ({horizon_bars} bars)")
     print(f"  ENABLE_ADAPTIVE_HORIZON={bool(getattr(cfg, 'ENABLE_ADAPTIVE_HORIZON', False))}")
     if bool(getattr(cfg, "ENABLE_ADAPTIVE_HORIZON", False)):
         print(
             "  ADAPTIVE_HORIZON="
-            f"{int(getattr(cfg, 'ADAPTIVE_HORIZON_MIN', 0))}"
-            f"..{int(getattr(cfg, 'ADAPTIVE_HORIZON_MAX', 0))}"
+            f"{min_duration}..{max_duration} "
+            f"({duration_to_bars(min_duration, timeframe)}"
+            f"..{duration_to_bars(max_duration, timeframe)} bars)"
         )
+    if sequence_windows:
+        sequence_text = ", ".join(
+            f"{duration}={bars} bars" for duration, bars in sequence_windows
+        )
+        print(f"  SEQUENCES={sequence_text}")
     print(f"  USE_DYNAMIC_BARRIERS={bool(getattr(cfg, 'USE_DYNAMIC_BARRIERS', False))}")
     if bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", False)):
         print(
@@ -330,20 +522,36 @@ def config_item(label: str, value: str) -> str:
     return f"<div><span>{escape(label)}</span><strong>{escape(value)}</strong></div>"
 
 
-def target_distribution_svg(overall: pd.DataFrame) -> str:
+def target_distribution_svg(
+    overall: pd.DataFrame,
+    report_profile: dict | None = None,
+) -> str:
+    semantics = label_semantics(report_profile or resolve_report_profile())
     row = overall.iloc[0]
-    values = [
-        ("Short", int(row["short"]), "#fb7185"),
-        ("Neutral", int(row["neutral"]), "#94a3b8"),
-        ("Long", int(row["long"]), "#34d399"),
-    ]
+    mode = (report_profile or resolve_report_profile())["mode"]
+    if mode == "dual":
+        values = [
+            (semantics["negative_name"], int(row["short"]), "#fb7185"),
+            (semantics["neutral_name"], int(row["neutral"]), "#94a3b8"),
+            (semantics["positive_name"], int(row["long"]), "#34d399"),
+        ]
+    elif mode == "long":
+        values = [
+            (semantics["neutral_name"], int(row["neutral"]), "#94a3b8"),
+            (semantics["positive_name"], int(row["long"]), "#34d399"),
+        ]
+    else:
+        values = [
+            (semantics["neutral_name"], int(row["neutral"]), "#94a3b8"),
+            (semantics["negative_name"], int(row["short"]), "#fb7185"),
+        ]
     total = max(sum(value for _, value, _ in values), 1)
     width = 680
     height = 300
     bar_area_width = 420
     x0 = 160
-    y0 = 48
-    gap = 30
+    y0 = 48 if len(values) == 3 else 70
+    gap = 30 if len(values) == 3 else 44
     bar_height = 46
     items = [
         '<defs><filter id="barGlow" x="-20%" y="-80%" width="140%" height="260%">'
@@ -423,10 +631,33 @@ def monthly_coverage_svg(monthly: pd.DataFrame, low_threshold: float) -> str:
     return f'<svg viewBox="0 0 {width} {height}" width="100%" height="360" role="img">{"".join(items)}</svg>'
 
 
-def build_config_items() -> str:
+def build_config_items(
+    report_profile: dict | None = None,
+    sequence_windows: list[tuple[str, int]] | None = None,
+) -> str:
+    report_profile = report_profile or resolve_report_profile()
+    timeframe = report_profile["timeframe"]
+    horizon_duration = str(getattr(cfg, "HORIZON_DURATION", "12h"))
+    min_duration = str(getattr(cfg, "ADAPTIVE_HORIZON_MIN_DURATION", "8h"))
+    max_duration = str(getattr(cfg, "ADAPTIVE_HORIZON_MAX_DURATION", "20h"))
     items = [
-        config_item("HORIZON", str(int(getattr(cfg, "HORIZON", 0)))),
+        config_item("Model profile", report_profile["name"]),
+        config_item("Target", report_profile["target_column"]),
+        config_item(
+            "Timeframes",
+            f"{timeframe} -> {report_profile['htf_timeframe']}",
+        ),
+        config_item(
+            "Horizon",
+            f"{horizon_duration} ({duration_to_bars(horizon_duration, timeframe)} bars)",
+        ),
         config_item("Adaptive horizon", str(bool(getattr(cfg, "ENABLE_ADAPTIVE_HORIZON", False)))),
+        config_item(
+            "Adaptive range",
+            f"{min_duration}..{max_duration} "
+            f"({duration_to_bars(min_duration, timeframe)}"
+            f"..{duration_to_bars(max_duration, timeframe)} bars)",
+        ),
         config_item("Dynamic barriers", str(bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", False)))),
         config_item("TP/SL ratio", f"{float(getattr(cfg, 'BARRIER_TP_TO_SL_RATIO', 0.0)):.2f}"),
         config_item("Barrier min", f"{float(getattr(cfg, 'BARRIER_MIN_PCT', 0.0)):.4f}"),
@@ -437,6 +668,16 @@ def build_config_items() -> str:
         config_item("Slippage", f"{float(getattr(cfg, 'SLIPPAGE', 0.0)):.6f}"),
         config_item("END_DATE", str(getattr(cfg, "END_DATE", None))),
     ]
+    if sequence_windows:
+        items.append(
+            config_item(
+                "Sequences",
+                ", ".join(
+                    f"{duration}={bars} bars"
+                    for duration, bars in sequence_windows
+                ),
+            )
+        )
     return "".join(items)
 
 
@@ -458,21 +699,61 @@ def render_html_report(
     sequence_samples: pd.DataFrame,
     monthly: pd.DataFrame,
     low_ratio: float,
+    report_profile: dict | None = None,
+    sequence_windows: list[tuple[str, int]] | None = None,
 ) -> Path:
+    report_profile = report_profile or resolve_report_profile()
+    semantics = label_semantics(report_profile)
     stability = build_monthly_stability(monthly, low_ratio)
     overall_row = overall.iloc[0]
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    title = "Label Coverage Report"
+    title = f"Label Coverage Report: {report_profile['name']}"
     subtitle = (
         f"Период: {frame[train.TIMESTAMP_COLUMN].min()} -> {frame[train.TIMESTAMP_COLUMN].max()} | "
-        f"Символы: {', '.join(sorted(frame[train.SYMBOL_COLUMN].astype(str).unique()))}"
+        f"Символы: {', '.join(sorted(frame[train.SYMBOL_COLUMN].astype(str).unique()))} | "
+        f"Target: {report_profile['target_column']} | "
+        f"TF: {report_profile['timeframe']} -> {report_profile['htf_timeframe']}"
     )
+    if report_profile["mode"] == "dual":
+        class_cards = [
+            metric_card(
+                "Long share",
+                percent(float(overall_row["long_share_directional"])),
+                "среди сигналов",
+                "green",
+            ),
+            metric_card(
+                "Short share",
+                percent(float(overall_row["short_share_directional"])),
+                "среди сигналов",
+                "red",
+            ),
+        ]
+    else:
+        class_cards = [
+            metric_card(
+                f"{semantics['signal_name']} rows",
+                f"{int(overall_row['directional']):,}",
+                semantics["signal_description"],
+                "green",
+            ),
+            metric_card(
+                "No-signal share",
+                percent(1.0 - float(overall_row["directional_rate"])),
+                f"{report_profile['target_column']} = 0",
+                "yellow",
+            ),
+        ]
     metric_cards = "".join(
         [
             metric_card("Всего строк", f"{int(overall_row['rows']):,}", "после ETL и END_DATE", "blue"),
-            metric_card("Directional coverage", percent(float(overall_row["directional_rate"])), "Target != 0", "green"),
-            metric_card("Long share", percent(float(overall_row["long_share_directional"])), "среди directional", "green"),
-            metric_card("Short share", percent(float(overall_row["short_share_directional"])), "среди directional", "red"),
+            metric_card(
+                f"{semantics['signal_name']} coverage",
+                percent(float(overall_row["directional_rate"])),
+                semantics["signal_description"],
+                "green",
+            ),
+            *class_cards,
             metric_card("Monthly mean", percent(stability["mean_rate"]), "среднее покрытие", "blue"),
             metric_card("Monthly CV", f"{stability['cv']:.3f}", "ниже = стабильнее", "yellow"),
             metric_card("Max/min", "inf" if not np.isfinite(stability["max_to_min"]) else f"{stability['max_to_min']:.2f}x", "разброс месяцев", "purple"),
@@ -497,8 +778,8 @@ def render_html_report(
         subtitle=escape(subtitle),
         generated_at=escape(generated_at),
         metric_cards=metric_cards,
-        config_items=build_config_items(),
-        target_distribution_chart=target_distribution_svg(overall),
+        config_items=build_config_items(report_profile, sequence_windows),
+        target_distribution_chart=target_distribution_svg(overall, report_profile),
         monthly_coverage_chart=monthly_coverage_svg(monthly, stability["low_threshold"]),
         stability_summary=stability_summary,
         weakest_months_table=html_table(stability["weakest"], percent_columns=("directional_rate",)),
@@ -524,11 +805,20 @@ def render_html_report(
 
 def main() -> None:
     args = parse_args()
-    frame = load_target_frame(args.db_path, args.symbols, args.timeframe_profile)
+    report_profile = resolve_report_profile(
+        model_profile_name=args.model_profile,
+        timeframe_profile_name=args.timeframe_profile,
+    )
+    sequence_windows = resolve_sequence_windows(
+        sequence_durations=args.sequence_durations,
+        sequence_lengths=args.sequence_lengths,
+        timeframe=report_profile["timeframe"],
+    )
+    frame = load_target_frame(args.db_path, args.symbols, report_profile)
     if frame.empty:
         raise RuntimeError("No labeled feature rows found. Run etl.py first.")
 
-    print_config_snapshot()
+    print_config_snapshot(report_profile, sequence_windows)
     print(f"Loaded labeled rows: {len(frame)}")
     print(f"Period: {frame[train.TIMESTAMP_COLUMN].min()} -> {frame[train.TIMESTAMP_COLUMN].max()}")
     print(f"Symbols: {', '.join(sorted(frame[train.SYMBOL_COLUMN].astype(str).unique()))}")
@@ -536,12 +826,18 @@ def main() -> None:
 
     overall = build_target_summary(frame)
     by_symbol = build_target_summary(frame, [train.SYMBOL_COLUMN]).sort_values(train.SYMBOL_COLUMN)
-    print_summary_table("Overall Target coverage:", overall)
-    print_summary_table("Target coverage by symbol:", by_symbol)
+    print_summary_table(
+        f"Overall {report_profile['target_column']} coverage:",
+        overall,
+    )
+    print_summary_table(
+        f"{report_profile['target_column']} coverage by symbol:",
+        by_symbol,
+    )
 
-    sequence_samples = estimate_sequence_samples(frame, args.sequence_lengths)
-    for length in args.sequence_lengths:
-        column = f"seq_{int(length)}_eligible"
+    sequence_samples = estimate_sequence_samples(frame, sequence_windows)
+    for duration, bars in sequence_windows:
+        column = f"seq_{duration}_{bars}bars_eligible"
         sequence_samples[f"{column}_ok"] = sequence_samples[column] >= int(args.min_directional_rows)
     print("Estimated directional sequence samples:")
     print(sequence_samples.to_string(index=False))
@@ -551,16 +847,30 @@ def main() -> None:
     print_monthly_stability(monthly, args.stability_low_ratio)
 
     if args.monthly:
-        print_summary_table("Monthly Target coverage:", monthly)
+        print_summary_table(
+            f"Monthly {report_profile['target_column']} coverage:",
+            monthly,
+        )
+
+    html_output = args.html_output
+    if html_output is None:
+        filename = (
+            "label_coverage_report.html"
+            if report_profile["name"] == "dual_v1"
+            else f"label_coverage_report_{report_profile['name']}.html"
+        )
+        html_output = str(cfg.MODELS_DIR / filename)
 
     html_path = render_html_report(
-        output_path=args.html_output,
+        output_path=html_output,
         frame=frame,
         overall=overall,
         by_symbol=by_symbol,
         sequence_samples=sequence_samples,
         monthly=monthly,
         low_ratio=args.stability_low_ratio,
+        report_profile=report_profile,
+        sequence_windows=sequence_windows,
     )
     print(f"HTML report saved: {html_path}")
 
