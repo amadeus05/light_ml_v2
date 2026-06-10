@@ -22,7 +22,15 @@ ANSI_YELLOW = "\033[93m"
 ANSI_RESET = "\033[0m"
 
 BASE_OUTPUT_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
-BARRIER_OUTPUT_COLUMNS = ["barrier_stop_pct", "barrier_take_pct"]
+LABELING_OUTPUT_COLUMNS = [
+    "barrier_stop_pct",
+    "barrier_take_pct",
+    "label_horizon_bars",
+    "long_label_pnl",
+    "short_label_pnl",
+    "long_exit_reason",
+    "short_exit_reason",
+]
 TARGET_OUTPUT_COLUMNS = ["Target", "TargetLong", "TargetShort"]
 
 
@@ -84,6 +92,22 @@ def compute_effective_horizons(df: pd.DataFrame, timeframe: str = "1h") -> np.nd
     return adaptive
 
 
+def resolve_effective_horizons(df: pd.DataFrame, timeframe: str = "1h") -> np.ndarray:
+    if "label_horizon_bars" not in df.columns:
+        return compute_effective_horizons(df, timeframe)
+
+    values = pd.to_numeric(df["label_horizon_bars"], errors="raise").to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("label_horizon_bars contains non-finite values.")
+    rounded = np.rint(values)
+    if not np.array_equal(values, rounded) or np.any(rounded < 1):
+        invalid = sorted(set(values[(values != rounded) | (rounded < 1)].tolist()))
+        raise ValueError(
+            f"label_horizon_bars must contain positive integer values; found: {invalid}"
+        )
+    return rounded.astype(np.int32)
+
+
 def compute_dynamic_barrier_stop_pct(
     close: pd.Series,
     atr_14: pd.Series,
@@ -124,6 +148,7 @@ def attach_barrier_columns(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFr
     atr_window = duration_to_bars("14h", timeframe, minimum=2)
     atr_14 = compute_atr(output["high"], output["low"], close, length=atr_window)
     effective_horizons = compute_effective_horizons(output, timeframe)
+    output["label_horizon_bars"] = effective_horizons
 
     if bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", True)):
         if "realized_vol_1h" not in output.columns:
@@ -189,6 +214,7 @@ def simulate_trade_outcome(
     opens: np.ndarray,
     highs: np.ndarray,
     lows: np.ndarray,
+    closes: np.ndarray,
     stop_pcts: np.ndarray,
     take_pcts: np.ndarray,
     start_idx: int,
@@ -221,29 +247,67 @@ def simulate_trade_outcome(
         if exit_price is not None:
             return compute_clean_pnl(direction, entry_price, exit_price), reason
 
-    return 0.0, None
+    vertical_barrier_idx = min(start_idx + horizon, len(closes) - 1)
+    vertical_close = closes[vertical_barrier_idx]
+    if not np.isfinite(vertical_close):
+        return 0.0, None
+    exit_price = (
+        vertical_close * (1 - slippage)
+        if direction == 1
+        else vertical_close * (1 + slippage)
+    )
+    return compute_clean_pnl(direction, entry_price, exit_price), "TIMEOUT"
 
 
 def triple_barrier_labeling(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
     labels = []
     long_labels = []
     short_labels = []
-    effective_horizons = compute_effective_horizons(df, timeframe)
+    long_pnls = []
+    short_pnls = []
+    long_exit_reasons = []
+    short_exit_reasons = []
+    effective_horizons = resolve_effective_horizons(df, timeframe)
     max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon(timeframe)
 
     opens = df["open"].values
     highs = df["high"].values
     lows = df["low"].values
+    closes = df["close"].values
     stop_pcts = df["barrier_stop_pct"].values
     take_pcts = df["barrier_take_pct"].values
 
     for i in range(len(df) - max_horizon):
         label = 0
         horizon = int(effective_horizons[i]) if i < len(effective_horizons) else get_base_horizon(timeframe)
-        long_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=1, horizon=horizon)
-        short_pnl, _ = simulate_trade_outcome(opens, highs, lows, stop_pcts, take_pcts, i, direction=-1, horizon=horizon)
+        long_pnl, long_reason = simulate_trade_outcome(
+            opens,
+            highs,
+            lows,
+            closes,
+            stop_pcts,
+            take_pcts,
+            i,
+            direction=1,
+            horizon=horizon,
+        )
+        short_pnl, short_reason = simulate_trade_outcome(
+            opens,
+            highs,
+            lows,
+            closes,
+            stop_pcts,
+            take_pcts,
+            i,
+            direction=-1,
+            horizon=horizon,
+        )
         long_labels.append(int(long_pnl > 0))
         short_labels.append(int(short_pnl > 0))
+        long_pnls.append(float(long_pnl))
+        short_pnls.append(float(short_pnl))
+        long_exit_reasons.append(long_reason)
+        short_exit_reasons.append(short_reason)
 
         if long_pnl > 0 and short_pnl <= 0:
             label = 1
@@ -255,10 +319,18 @@ def triple_barrier_labeling(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataF
     labels.extend([0] * max_horizon)
     long_labels.extend([0] * max_horizon)
     short_labels.extend([0] * max_horizon)
+    long_pnls.extend([np.nan] * max_horizon)
+    short_pnls.extend([np.nan] * max_horizon)
+    long_exit_reasons.extend([None] * max_horizon)
+    short_exit_reasons.extend([None] * max_horizon)
     output = df.copy()
     output["Target"] = labels
     output["TargetLong"] = long_labels
     output["TargetShort"] = short_labels
+    output["long_label_pnl"] = long_pnls
+    output["short_label_pnl"] = short_pnls
+    output["long_exit_reason"] = long_exit_reasons
+    output["short_exit_reason"] = short_exit_reasons
     return output
 
 
@@ -269,12 +341,12 @@ def finalize_feature_frame(
 ) -> pd.DataFrame:
     output = df.copy()
     input_rows = len(output)
-    effective_horizons = compute_effective_horizons(output, timeframe)
+    effective_horizons = resolve_effective_horizons(output, timeframe)
     max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon(timeframe)
     horizon_dropped_rows = min(max_horizon, len(output)) if max_horizon > 0 else 0
     if max_horizon > 0:
         if len(output) <= max_horizon:
-            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
+            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
             logger.warning(
                 "Feature finalize removed all rows: input_rows=%s max_horizon=%s output_rows=0",
                 input_rows,
@@ -283,7 +355,7 @@ def finalize_feature_frame(
             return output.iloc[0:0][empty_columns].copy()
         output = output.iloc[:-max_horizon].copy()
 
-    output_columns = BASE_OUTPUT_COLUMNS + feature_columns + BARRIER_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
+    output_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
     for column in output_columns:
         if column not in output.columns:
             output[column] = np.nan
@@ -357,6 +429,8 @@ def build_labeling_snapshot(timeframe_profile: dict | None = None) -> dict:
         ),
         "adaptive_horizon_vol_low": float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_LOW", 0.0)),
         "adaptive_horizon_vol_high": float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_HIGH", 0.0)),
+        "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
+        "vertical_barrier_exit": str(getattr(cfg, "VERTICAL_BARRIER_EXIT", "horizon_close")),
     }
 
 

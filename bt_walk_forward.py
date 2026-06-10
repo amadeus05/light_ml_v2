@@ -125,6 +125,15 @@ def load_candidate_and_training_frames(
         symbols,
         timeframe=timeframe_profile["timeframe"],
     )
+    missing_contract_columns = sorted(
+        train.LABELING_CONTRACT_COLUMNS - set(frame.columns)
+    )
+    if missing_contract_columns:
+        raise RuntimeError(
+            "Dataset uses the old labeling contract and is missing columns "
+            f"{missing_contract_columns}. Re-run etl.py for "
+            f"'{model_profiles[0]['timeframe_profile']}'."
+        )
     required_targets = [profile["target_column"] for profile in model_profiles]
     missing_targets = sorted(set(required_targets) - set(frame.columns))
     if missing_targets:
@@ -533,6 +542,7 @@ def build_features_meta(
             profile["name"]: profile["feature_profile"]
             for profile in profiles
         },
+        "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
         "probability_semantics": probability_semantics,
         "symbols": list(symbols),
         "rows": int(len(predictions)),

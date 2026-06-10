@@ -34,13 +34,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 TARGET_COLUMN = "Target"
 MODEL_TARGET_COLUMNS = {"Target", "TargetLong", "TargetShort"}
+LABELING_CONTRACT_COLUMNS = {
+    "barrier_stop_pct",
+    "barrier_take_pct",
+    "label_horizon_bars",
+}
+LABEL_DIAGNOSTIC_COLUMNS = {
+    "long_label_pnl",
+    "short_label_pnl",
+    "long_exit_reason",
+    "short_exit_reason",
+}
 TIMESTAMP_COLUMN = "timestamp"
 SYMBOL_COLUMN = "symbol"
 RESERVED_COLUMNS = {
     *MODEL_TARGET_COLUMNS,
+    *LABELING_CONTRACT_COLUMNS,
+    *LABEL_DIAGNOSTIC_COLUMNS,
     TIMESTAMP_COLUMN,
-    "barrier_stop_pct",
-    "barrier_take_pct",
 }
 EXCLUDED_RAW_FEATURE_COLUMNS = {
     "open",
@@ -88,6 +99,8 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
             "barrier_tp_to_sl_ratio": float(getattr(cfg, "BARRIER_TP_TO_SL_RATIO", 0.0)),
             "barrier_min_pct": float(getattr(cfg, "BARRIER_MIN_PCT", 0.0)),
             "barrier_max_pct": float(getattr(cfg, "BARRIER_MAX_PCT", 0.0)),
+            "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
+            "vertical_barrier_exit": str(getattr(cfg, "VERTICAL_BARRIER_EXIT", "horizon_close")),
         },
         "training": {
             "model_profile": model_profile["name"],
@@ -230,6 +243,13 @@ def load_training_frame(db_path, symbols, model_profile=None):
 
     repository = HistoricalKlineRepository(db_path=db_path)
     dataset = repository.load_feature_dataset(symbols, timeframe=timeframe)
+    missing_contract_columns = sorted(LABELING_CONTRACT_COLUMNS - set(dataset.columns))
+    if missing_contract_columns:
+        raise RuntimeError(
+            "Dataset uses the old labeling contract and is missing columns "
+            f"{missing_contract_columns}. Re-run etl.py for "
+            f"'{model_profile['timeframe_profile']}'."
+        )
     if source_target not in dataset.columns:
         raise RuntimeError(
             f"Dataset is missing target column '{source_target}' for model profile "
@@ -1657,6 +1677,7 @@ def save_directional_artifacts(
         "htf_timeframe": cfg.get_timeframe_profile(model_profile["timeframe_profile"])["htf_timeframe"],
         "target_column": model_profile["target_column"],
         "feature_profile": model_profile["feature_profile"],
+        "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
         **build_model_label_metadata(model_profile),
         "symbols": list(args.symbols),
         "rows": int(len(dataset)),

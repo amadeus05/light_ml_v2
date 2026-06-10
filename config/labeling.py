@@ -5,6 +5,8 @@ from src.timeframes import duration_to_bars
 
 HORIZON = 12
 HORIZON_DURATION = "12h"
+LABELING_CONTRACT_VERSION = "triple_barrier_horizon_close_v1"
+VERTICAL_BARRIER_EXIT = "horizon_close"
 TP_PCT = 0.03
 SL_PCT = 0.015
 

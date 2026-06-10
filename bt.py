@@ -109,6 +109,8 @@ def format_reason(reason: str) -> str:
         return colorize("✅ TP", ANSI_GREEN)
     if reason == "SL":
         return colorize("❌ SL", ANSI_RED)
+    if reason == "TIMEOUT":
+        return colorize("⏱ TIMEOUT", ANSI_YELLOW)
     return reason
 
 
@@ -161,6 +163,16 @@ def get_barrier_pcts(feature_row: pd.DataFrame | None) -> tuple[float | None, fl
     if stop_pct <= 0 or take_pct <= 0:
         return None, None
     return stop_pct, take_pct
+
+
+def get_label_horizon_bars(feature_row: pd.DataFrame | None) -> int | None:
+    if feature_row is None or feature_row.empty or "label_horizon_bars" not in feature_row.columns:
+        return None
+
+    value = float(feature_row["label_horizon_bars"].iloc[0])
+    if not np.isfinite(value) or value < 1 or not value.is_integer():
+        return None
+    return int(value)
 
 
 def compact_symbol(symbol: str) -> str:
@@ -221,6 +233,11 @@ def resolve_trade_exit(
             exit_price = take_price * (1 + SLIPPAGE)
             return exit_price, "TP"
     return None, None
+
+
+def resolve_vertical_barrier_exit(direction: int, close_price: float) -> tuple[float, str]:
+    exit_price = close_price * (1 - SLIPPAGE) if direction == 1 else close_price * (1 + SLIPPAGE)
+    return exit_price, "TIMEOUT"
 
 
 def resolve_entry_candidate_exit(candidate: dict, market_batch: dict) -> tuple[float | None, str | None]:
@@ -573,6 +590,17 @@ def backtest(
     model_mode = str(features_meta.get("model_mode", "dual"))
     timeframe = str(features_meta.get("timeframe", TIMEFRAME))
     htf_timeframe = str(features_meta.get("htf_timeframe", HTF_TIMEFRAME))
+    expected_labeling_contract = str(
+        globals().get("LABELING_CONTRACT_VERSION", "")
+    )
+    artifact_labeling_contract = str(features_meta.get("labeling_contract", ""))
+    if artifact_labeling_contract != expected_labeling_contract:
+        print(
+            "Error: model metadata uses an incompatible labeling contract "
+            f"('{artifact_labeling_contract or 'missing'}' != "
+            f"'{expected_labeling_contract}'). Re-run train.py."
+        )
+        return
     if model_mode == "long_short" and not using_external_predictions:
         print("Error: long_short mode requires combined external predictions.")
         return
@@ -636,10 +664,18 @@ def backtest(
 
     if using_external_predictions:
         print("Feature mode: external predictions + DB barriers")
-        required_feature_columns = ["barrier_stop_pct", "barrier_take_pct"]
+        required_feature_columns = [
+            "barrier_stop_pct",
+            "barrier_take_pct",
+            "label_horizon_bars",
+        ]
     else:
         print("Feature mode: precomputed DB features (ETL)")
-        required_feature_columns = feature_names + ["barrier_stop_pct", "barrier_take_pct"]
+        required_feature_columns = feature_names + [
+            "barrier_stop_pct",
+            "barrier_take_pct",
+            "label_horizon_bars",
+        ]
     feature_timestamp_shift = pd.to_timedelta(timeframe_to_ms(timeframe), unit="ms")
     execution_start_ts, execution_end_ts = build_execution_window(
         test_start_ts,
@@ -834,6 +870,12 @@ def backtest(
                 pos["stop_pct"],
                 pos["take_pct"],
             )
+            pos["bars_held"] += 1
+            if exit_price is None and pos["bars_held"] >= pos["horizon_bars"]:
+                exit_price, reason = resolve_vertical_barrier_exit(
+                    pos["dir"],
+                    ctx["next_close"],
+                )
             if exit_price is None or reason is None:
                 continue
 
@@ -968,7 +1010,11 @@ def backtest(
         if has_signal_batch:
             for sym, proba in zip(batch_symbols, batch_proba):
                 ctx = market_batch[sym]
-                required_row_columns = ["barrier_stop_pct", "barrier_take_pct"]
+                required_row_columns = [
+                    "barrier_stop_pct",
+                    "barrier_take_pct",
+                    "label_horizon_bars",
+                ]
                 if not using_external_predictions:
                     required_row_columns = feature_names + required_row_columns
                 feature_row = get_feature_row_precomputed(
@@ -977,7 +1023,8 @@ def backtest(
                     required_row_columns,
                 )
                 stop_pct, take_pct = get_barrier_pcts(feature_row)
-                if stop_pct is None or take_pct is None:
+                horizon_bars = get_label_horizon_bars(feature_row)
+                if stop_pct is None or take_pct is None or horizon_bars is None:
                     continue
                 p_short, p_long = normalize_direction_probabilities(
                     proba,
@@ -1019,6 +1066,7 @@ def backtest(
                         "required_margin": required_margin,
                         "stop_pct": stop_pct,
                         "take_pct": take_pct,
+                        "horizon_bars": horizon_bars,
                         "p_long": p_long,
                         "p_short": p_short,
                         "direction_prob": direction_prob,
@@ -1067,6 +1115,8 @@ def backtest(
                 "margin": required_margin,
                 "stop_pct": candidate["stop_pct"],
                 "take_pct": candidate["take_pct"],
+                "horizon_bars": candidate["horizon_bars"],
+                "bars_held": 0,
                 "ts_open": next_ts,
             }
             opened_this_bar += 1
@@ -1084,6 +1134,16 @@ def backtest(
             # Keep backtest execution aligned with ETL labeling:
             # a newly opened trade can be stopped/taken on the entry candle.
             exit_price, reason = resolve_entry_candidate_exit(candidate, market_batch)
+            positions[candidate["sym"]]["bars_held"] = 1
+            if (
+                exit_price is None
+                and positions[candidate["sym"]]["bars_held"]
+                >= positions[candidate["sym"]]["horizon_bars"]
+            ):
+                exit_price, reason = resolve_vertical_barrier_exit(
+                    candidate["signal"],
+                    market_batch[candidate["sym"]]["next_close"],
+                )
             if exit_price is None or reason is None:
                 continue
 
@@ -1321,7 +1381,15 @@ def backtest(
     for trade in trades:
         stats = symbol_stats.setdefault(
             trade["sym"],
-            {"trades": 0, "tp": 0, "sl": 0, "wins": 0, "losses": 0, "pnl_abs": 0.0},
+            {
+                "trades": 0,
+                "tp": 0,
+                "sl": 0,
+                "timeout": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl_abs": 0.0,
+            },
         )
         stats["trades"] += 1
         stats["pnl_abs"] += trade["pnl_abs"]
@@ -1329,6 +1397,8 @@ def backtest(
             stats["tp"] += 1
         if trade["reason"] == "SL":
             stats["sl"] += 1
+        if trade["reason"] == "TIMEOUT":
+            stats["timeout"] += 1
         if trade["pnl_abs"] > 0:
             stats["wins"] += 1
         else:
@@ -1345,6 +1415,7 @@ def backtest(
                     str(stats["trades"]),
                     str(stats["tp"]),
                     str(stats["sl"]),
+                    str(stats["timeout"]),
                     f"{winrate:.1f}%",
                     format_signed_dollars(stats["pnl_abs"]),
                 ]
@@ -1352,9 +1423,9 @@ def backtest(
 
         print("\n📊 Summary by Coin:")
         print_table(
-            ["Symbol", "Trades", "TP", "SL", "Winrate", "PnL"],
+            ["Symbol", "Trades", "TP", "SL", "Timeout", "Winrate", "PnL"],
             coin_rows,
-            right_align={1, 2, 3, 4, 5},
+            right_align={1, 2, 3, 4, 5, 6},
         )
 
     direction_stats = {
