@@ -11,9 +11,12 @@ from src.contracts.exchange_contract import ExchangeContract
 from src.exchanges.binance.binance_service import BinanceService
 from src.exchanges.bybit.bybit_service import BybitService
 from src.features import MasterFeatureBuilder
-from src.features.indicators import compute_atr, safe_ratio
+from src.labeling import (
+    LABELING_SCHEMA,
+    TripleBarrierLabeler,
+)
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
-from src.timeframes import duration_to_bars, timeframe_hours
+from src.timeframes import duration_to_bars
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,16 +25,6 @@ ANSI_YELLOW = "\033[93m"
 ANSI_RESET = "\033[0m"
 
 BASE_OUTPUT_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
-LABELING_OUTPUT_COLUMNS = [
-    "barrier_stop_pct",
-    "barrier_take_pct",
-    "label_horizon_bars",
-    "long_label_pnl",
-    "short_label_pnl",
-    "long_exit_reason",
-    "short_exit_reason",
-]
-TARGET_OUTPUT_COLUMNS = ["Target", "TargetLong", "TargetShort"]
 
 
 def parse_args():
@@ -45,67 +38,15 @@ def parse_args():
 
 
 def get_base_horizon(timeframe: str = "1h") -> int:
-    duration = str(getattr(cfg, "HORIZON_DURATION", f"{int(getattr(cfg, 'HORIZON', 16))}h"))
-    return duration_to_bars(duration, timeframe)
+    return TripleBarrierLabeler(timeframe=timeframe).get_base_horizon()
 
 
 def compute_effective_horizons(df: pd.DataFrame, timeframe: str = "1h") -> np.ndarray:
-    base_horizon = max(1, get_base_horizon(timeframe))
-    if not bool(getattr(cfg, "ENABLE_ADAPTIVE_HORIZON", False)):
-        return np.full(len(df), base_horizon, dtype=np.int32)
-
-    if "realized_vol_1h" not in df.columns:
-        logger.warning("Adaptive horizon enabled, but 'realized_vol_1h' is missing. Falling back to fixed horizon=%s.", base_horizon)
-        return np.full(len(df), base_horizon, dtype=np.int32)
-
-    min_horizon = duration_to_bars(
-        str(getattr(cfg, "ADAPTIVE_HORIZON_MIN_DURATION", "8h")),
-        timeframe,
-    )
-    max_horizon = duration_to_bars(
-        str(getattr(cfg, "ADAPTIVE_HORIZON_MAX_DURATION", "20h")),
-        timeframe,
-    )
-    if min_horizon > max_horizon:
-        min_horizon, max_horizon = max_horizon, min_horizon
-    min_horizon = max(1, min_horizon)
-    max_horizon = max(min_horizon, max_horizon)
-
-    vol_low = float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_LOW", 0.005))
-    vol_high = float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_HIGH", 0.025))
-    if not np.isfinite(vol_low) or not np.isfinite(vol_high) or vol_high <= vol_low:
-        logger.warning(
-            "Invalid adaptive horizon volatility bounds (low=%s, high=%s). Falling back to fixed horizon=%s.",
-            vol_low,
-            vol_high,
-            base_horizon,
-        )
-        return np.full(len(df), base_horizon, dtype=np.int32)
-
-    vol = pd.Series(df["realized_vol_1h"], copy=False).astype(float).abs()
-    normalized = ((vol - vol_low) / (vol_high - vol_low)).clip(lower=0.0, upper=1.0)
-    normalized_values = normalized.to_numpy()
-    adaptive_raw = np.rint(max_horizon - normalized_values * (max_horizon - min_horizon))
-    adaptive = np.full(len(df), base_horizon, dtype=np.int32)
-    valid_mask = np.isfinite(adaptive_raw)
-    adaptive[valid_mask] = np.clip(adaptive_raw[valid_mask], min_horizon, max_horizon).astype(np.int32)
-    return adaptive
+    return TripleBarrierLabeler(timeframe=timeframe).compute_effective_horizons(df)
 
 
 def resolve_effective_horizons(df: pd.DataFrame, timeframe: str = "1h") -> np.ndarray:
-    if "label_horizon_bars" not in df.columns:
-        return compute_effective_horizons(df, timeframe)
-
-    values = pd.to_numeric(df["label_horizon_bars"], errors="raise").to_numpy(dtype=float)
-    if not np.isfinite(values).all():
-        raise ValueError("label_horizon_bars contains non-finite values.")
-    rounded = np.rint(values)
-    if not np.array_equal(values, rounded) or np.any(rounded < 1):
-        invalid = sorted(set(values[(values != rounded) | (rounded < 1)].tolist()))
-        raise ValueError(
-            f"label_horizon_bars must contain positive integer values; found: {invalid}"
-        )
-    return rounded.astype(np.int32)
+    return TripleBarrierLabeler(timeframe=timeframe).resolve_effective_horizons(df)
 
 
 def compute_dynamic_barrier_stop_pct(
@@ -115,65 +56,24 @@ def compute_dynamic_barrier_stop_pct(
     effective_horizons: np.ndarray | None = None,
     timeframe: str = "1h",
 ) -> pd.Series:
-    atr_pct = safe_ratio(atr_14, close).abs()
-    if effective_horizons is None:
-        horizon_sqrt = np.sqrt(float(get_base_horizon(timeframe)) * timeframe_hours(timeframe))
-    else:
-        horizon_sqrt = np.sqrt(
-            np.maximum(effective_horizons.astype(float), 1.0)
-            * timeframe_hours(timeframe)
-        )
-    horizon_vol_pct = realized_vol_1h.abs() * horizon_sqrt
-
-    stop_pct = pd.concat(
-        [
-            atr_pct * float(getattr(cfg, "BARRIER_ATR_MULTIPLIER", 1.25)),
-            horizon_vol_pct * float(getattr(cfg, "BARRIER_RVOL_MULTIPLIER", 0.75)),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    min_pct = float(getattr(cfg, "BARRIER_MIN_PCT", getattr(cfg, "SL_PCT", 0.015)))
-    max_pct = float(getattr(cfg, "BARRIER_MAX_PCT", getattr(cfg, "TP_PCT", 0.03)))
-    return stop_pct.clip(lower=min_pct, upper=max_pct)
+    return TripleBarrierLabeler(timeframe=timeframe).compute_dynamic_barrier_stop_pct(
+        close,
+        atr_14,
+        realized_vol_1h,
+        effective_horizons=effective_horizons,
+    )
 
 
 def compute_dynamic_barrier_take_pct(stop_pct: pd.Series) -> pd.Series:
-    return stop_pct * float(getattr(cfg, "BARRIER_TP_TO_SL_RATIO", 2.0))
+    return TripleBarrierLabeler.compute_dynamic_barrier_take_pct(stop_pct)
 
 
 def attach_barrier_columns(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
-    output = df.copy()
-    close = output["close"]
-    atr_window = duration_to_bars("14h", timeframe, minimum=2)
-    atr_14 = compute_atr(output["high"], output["low"], close, length=atr_window)
-    effective_horizons = compute_effective_horizons(output, timeframe)
-    output["label_horizon_bars"] = effective_horizons
-
-    if bool(getattr(cfg, "USE_DYNAMIC_BARRIERS", True)):
-        if "realized_vol_1h" not in output.columns:
-            raise ValueError("Dynamic barriers require feature 'realized_vol_1h' to be enabled.")
-        output["barrier_stop_pct"] = compute_dynamic_barrier_stop_pct(
-            close,
-            atr_14,
-            output["realized_vol_1h"],
-            effective_horizons=effective_horizons,
-            timeframe=timeframe,
-        )
-        output["barrier_take_pct"] = compute_dynamic_barrier_take_pct(output["barrier_stop_pct"])
-    else:
-        output["barrier_stop_pct"] = float(getattr(cfg, "SL_PCT", 0.015))
-        output["barrier_take_pct"] = float(getattr(cfg, "TP_PCT", 0.03))
-    return output
+    return TripleBarrierLabeler(timeframe=timeframe).attach_barrier_columns(df)
 
 
 def compute_clean_pnl(direction: int, entry_price: float, exit_price: float) -> float:
-    if direction == 1:
-        raw_pnl = (exit_price - entry_price) / entry_price
-    else:
-        raw_pnl = (entry_price - exit_price) / entry_price
-    taker_com = float(getattr(cfg, "TAKER_COM", 0.0004))
-    return raw_pnl - (taker_com + taker_com)
+    return TripleBarrierLabeler.compute_clean_pnl(direction, entry_price, exit_price)
 
 
 def resolve_trade_exit(
@@ -185,29 +85,15 @@ def resolve_trade_exit(
     stop_pct: float,
     take_pct: float,
 ) -> tuple[float | None, str | None]:
-    slippage = float(getattr(cfg, "SLIPPAGE", 0.0003))
-    if direction == 1:
-        stop_price = entry_price * (1 - stop_pct)
-        take_price = entry_price * (1 + take_pct)
-
-        if next_low <= stop_price:
-            exit_price = (next_open if next_open < stop_price else stop_price) * (1 - slippage)
-            return exit_price, "SL"
-        if next_high >= take_price:
-            exit_price = take_price * (1 - slippage)
-            return exit_price, "TP"
-    else:
-        stop_price = entry_price * (1 + stop_pct)
-        take_price = entry_price * (1 - take_pct)
-
-        if next_high >= stop_price:
-            exit_price = (next_open if next_open > stop_price else stop_price) * (1 + slippage)
-            return exit_price, "SL"
-        if next_low <= take_price:
-            exit_price = take_price * (1 + slippage)
-            return exit_price, "TP"
-
-    return None, None
+    return TripleBarrierLabeler.resolve_trade_exit(
+        direction,
+        entry_price,
+        next_open,
+        next_high,
+        next_low,
+        stop_pct,
+        take_pct,
+    )
 
 
 def simulate_trade_outcome(
@@ -221,117 +107,21 @@ def simulate_trade_outcome(
     direction: int,
     horizon: int,
 ) -> tuple[float, str | None]:
-    slippage = float(getattr(cfg, "SLIPPAGE", 0.0003))
-    base_open = opens[start_idx + 1]
-    entry_price = base_open * (1 + slippage) if direction == 1 else base_open * (1 - slippage)
-    stop_pct = stop_pcts[start_idx]
-    take_pct = take_pcts[start_idx]
-
-    if np.isnan(stop_pct) or np.isnan(take_pct):
-        return 0.0, None
-
-    for j in range(1, horizon + 1):
-        candle_idx = start_idx + j
-        if candle_idx >= len(opens):
-            break
-
-        exit_price, reason = resolve_trade_exit(
-            direction,
-            entry_price,
-            opens[candle_idx],
-            highs[candle_idx],
-            lows[candle_idx],
-            stop_pct,
-            take_pct,
-        )
-        if exit_price is not None:
-            return compute_clean_pnl(direction, entry_price, exit_price), reason
-
-    vertical_barrier_idx = min(start_idx + horizon, len(closes) - 1)
-    vertical_close = closes[vertical_barrier_idx]
-    if not np.isfinite(vertical_close):
-        return 0.0, None
-    exit_price = (
-        vertical_close * (1 - slippage)
-        if direction == 1
-        else vertical_close * (1 + slippage)
+    return TripleBarrierLabeler.simulate_trade_outcome(
+        opens,
+        highs,
+        lows,
+        closes,
+        stop_pcts,
+        take_pcts,
+        start_idx,
+        direction,
+        horizon,
     )
-    return compute_clean_pnl(direction, entry_price, exit_price), "TIMEOUT"
 
 
 def triple_barrier_labeling(df: pd.DataFrame, timeframe: str = "1h") -> pd.DataFrame:
-    labels = []
-    long_labels = []
-    short_labels = []
-    long_pnls = []
-    short_pnls = []
-    long_exit_reasons = []
-    short_exit_reasons = []
-    effective_horizons = resolve_effective_horizons(df, timeframe)
-    max_horizon = int(np.max(effective_horizons)) if len(effective_horizons) > 0 else get_base_horizon(timeframe)
-
-    opens = df["open"].values
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-    stop_pcts = df["barrier_stop_pct"].values
-    take_pcts = df["barrier_take_pct"].values
-
-    for i in range(len(df) - max_horizon):
-        label = 0
-        horizon = int(effective_horizons[i]) if i < len(effective_horizons) else get_base_horizon(timeframe)
-        long_pnl, long_reason = simulate_trade_outcome(
-            opens,
-            highs,
-            lows,
-            closes,
-            stop_pcts,
-            take_pcts,
-            i,
-            direction=1,
-            horizon=horizon,
-        )
-        short_pnl, short_reason = simulate_trade_outcome(
-            opens,
-            highs,
-            lows,
-            closes,
-            stop_pcts,
-            take_pcts,
-            i,
-            direction=-1,
-            horizon=horizon,
-        )
-        long_labels.append(int(long_pnl > 0))
-        short_labels.append(int(short_pnl > 0))
-        long_pnls.append(float(long_pnl))
-        short_pnls.append(float(short_pnl))
-        long_exit_reasons.append(long_reason)
-        short_exit_reasons.append(short_reason)
-
-        if long_pnl > 0 and short_pnl <= 0:
-            label = 1
-        elif short_pnl > 0 and long_pnl <= 0:
-            label = -1
-
-        labels.append(label)
-
-    labels.extend([0] * max_horizon)
-    long_labels.extend([0] * max_horizon)
-    short_labels.extend([0] * max_horizon)
-    long_pnls.extend([np.nan] * max_horizon)
-    short_pnls.extend([np.nan] * max_horizon)
-    long_exit_reasons.extend([None] * max_horizon)
-    short_exit_reasons.extend([None] * max_horizon)
-    output = df.copy()
-    output["Target"] = labels
-    output["TargetLong"] = long_labels
-    output["TargetShort"] = short_labels
-    output["long_label_pnl"] = long_pnls
-    output["short_label_pnl"] = short_pnls
-    output["long_exit_reason"] = long_exit_reasons
-    output["short_exit_reason"] = short_exit_reasons
-    return output
+    return TripleBarrierLabeler(timeframe=timeframe).label(df)
 
 
 def finalize_feature_frame(
@@ -346,7 +136,7 @@ def finalize_feature_frame(
     horizon_dropped_rows = min(max_horizon, len(output)) if max_horizon > 0 else 0
     if max_horizon > 0:
         if len(output) <= max_horizon:
-            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
+            empty_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_SCHEMA.output_columns + list(LABELING_SCHEMA.targets)
             logger.warning(
                 "Feature finalize removed all rows: input_rows=%s max_horizon=%s output_rows=0",
                 input_rows,
@@ -355,7 +145,7 @@ def finalize_feature_frame(
             return output.iloc[0:0][empty_columns].copy()
         output = output.iloc[:-max_horizon].copy()
 
-    output_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_OUTPUT_COLUMNS + TARGET_OUTPUT_COLUMNS
+        output_columns = BASE_OUTPUT_COLUMNS + feature_columns + LABELING_SCHEMA.output_columns + list(LABELING_SCHEMA.targets)
     for column in output_columns:
         if column not in output.columns:
             output[column] = np.nan
@@ -403,6 +193,7 @@ def create_exchange_service() -> ExchangeContract:
 def build_labeling_snapshot(timeframe_profile: dict | None = None) -> dict:
     timeframe_profile = timeframe_profile or cfg.get_timeframe_profile()
     timeframe = timeframe_profile["timeframe"]
+    labeler = TripleBarrierLabeler(timeframe=timeframe)
     return {
         "experiment": str(getattr(cfg, "ACTIVE_EXPERIMENT", "default")),
         "labeling_profile": str(getattr(cfg, "LABELING_PROFILE", "default")),
@@ -432,6 +223,7 @@ def build_labeling_snapshot(timeframe_profile: dict | None = None) -> dict:
         "adaptive_horizon_vol_high": float(getattr(cfg, "ADAPTIVE_HORIZON_VOL_HIGH", 0.0)),
         "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
         "vertical_barrier_exit": str(getattr(cfg, "VERTICAL_BARRIER_EXIT", "horizon_close")),
+        "labeling_metadata": labeler.metadata(),
     }
 
 

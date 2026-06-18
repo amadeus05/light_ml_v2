@@ -23,34 +23,26 @@ from sklearn.model_selection import TimeSeriesSplit
 import config as cfg
 from src.features import MasterFeatureBuilder
 from src.features.models.feature_spec import serialize_feature_specs
+from src.labeling import (
+    BINARY_TARGET_VALUES,
+    CLASS_TO_LABEL,
+    DUAL_TARGET_VALUES,
+    LABEL_TO_CLASS,
+    LABELING_CONTRACT_COLUMNS,
+    LABELING_SCHEMA,
+    TARGET_COLUMN,
+    TripleBarrierLabeler,
+)
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
 from src.timeframes import duration_to_bars
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants & label mappings
-# ---------------------------------------------------------------------------
-TARGET_COLUMN = "Target"
-MODEL_TARGET_COLUMNS = {"Target", "TargetLong", "TargetShort"}
-LABELING_CONTRACT_COLUMNS = {
-    "barrier_stop_pct",
-    "barrier_take_pct",
-    "label_horizon_bars",
-}
-LABEL_DIAGNOSTIC_COLUMNS = {
-    "long_label_pnl",
-    "short_label_pnl",
-    "long_exit_reason",
-    "short_exit_reason",
-}
 TIMESTAMP_COLUMN = "timestamp"
 SYMBOL_COLUMN = "symbol"
 RESERVED_COLUMNS = {
-    *MODEL_TARGET_COLUMNS,
-    *LABELING_CONTRACT_COLUMNS,
-    *LABEL_DIAGNOSTIC_COLUMNS,
+    *LABELING_SCHEMA.required_columns,
     TIMESTAMP_COLUMN,
 }
 EXCLUDED_RAW_FEATURE_COLUMNS = {
@@ -60,8 +52,6 @@ EXCLUDED_RAW_FEATURE_COLUMNS = {
     "close",
     "volume",
 }
-LABEL_TO_CLASS = {-1: 0, 1: 1}
-CLASS_TO_LABEL = {0: -1, 1: 1}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -81,6 +71,7 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
         **cfg.get_model_profile(),
     }
     timeframe_profile = cfg.get_timeframe_profile(model_profile["timeframe_profile"])
+    labeler = TripleBarrierLabeler(timeframe=timeframe_profile["timeframe"])
     return {
         "experiment": str(getattr(cfg, "ACTIVE_EXPERIMENT", "default")),
         "labeling_profile": str(getattr(cfg, "LABELING_PROFILE", "default")),
@@ -101,6 +92,7 @@ def build_experiment_snapshot(model_profile: dict | None = None) -> dict:
             "barrier_max_pct": float(getattr(cfg, "BARRIER_MAX_PCT", 0.0)),
             "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
             "vertical_barrier_exit": str(getattr(cfg, "VERTICAL_BARRIER_EXIT", "horizon_close")),
+            "labeling_metadata": labeler.metadata(),
         },
         "training": {
             "model_profile": model_profile["name"],
@@ -278,7 +270,7 @@ def load_training_frame(db_path, symbols, model_profile=None):
     raw_labels = dataset[source_target].astype(int)
 
     if mode == "dual":
-        unknown_labels = sorted(set(raw_labels.unique()) - {-1, 0, 1})
+        unknown_labels = sorted(set(raw_labels.unique()) - set(DUAL_TARGET_VALUES))
         if unknown_labels:
             raise ValueError(f"Unexpected labels in {source_target}: {unknown_labels}")
         selected_mask = raw_labels != 0
@@ -290,7 +282,7 @@ def load_training_frame(db_path, symbols, model_profile=None):
         dataset = dataset.loc[selected_mask].copy()
         dataset[TARGET_COLUMN] = dataset[source_target].astype(int).map(LABEL_TO_CLASS)
     else:
-        unknown_labels = sorted(set(raw_labels.unique()) - {0, 1})
+        unknown_labels = sorted(set(raw_labels.unique()) - set(BINARY_TARGET_VALUES))
         if unknown_labels:
             raise ValueError(f"Unexpected labels in {source_target}: {unknown_labels}")
         excluded_rows = 0
@@ -1681,6 +1673,7 @@ def save_directional_artifacts(
         "target_column": model_profile["target_column"],
         "feature_profile": model_profile["feature_profile"],
         "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
+        "labeling_metadata": experiment_snapshot.get("labeling", {}).get("labeling_metadata"),
         **build_model_label_metadata(model_profile),
         "symbols": list(args.symbols),
         "rows": int(len(dataset)),

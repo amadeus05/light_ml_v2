@@ -9,6 +9,14 @@ from sklearn.model_selection import TimeSeriesSplit
 import bt
 import config as cfg
 import train
+from src.labeling import (
+    BINARY_TARGET_VALUES,
+    DUAL_TARGET_VALUES,
+    TARGET_COLUMN,
+    TARGET_LONG_COLUMN,
+    TARGET_SHORT_COLUMN,
+    TripleBarrierLabeler,
+)
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
 
 
@@ -160,7 +168,7 @@ def load_candidate_and_training_frames(
         labels = training_frame[target_column].astype(int)
 
         if profile["mode"] == "dual":
-            unknown = sorted(set(labels.unique()) - {-1, 0, 1})
+            unknown = sorted(set(labels.unique()) - set(DUAL_TARGET_VALUES))
             if unknown:
                 raise ValueError(f"Unexpected labels in {target_column}: {unknown}")
             training_frame = training_frame.loc[labels != 0].copy()
@@ -168,7 +176,7 @@ def load_candidate_and_training_frames(
                 training_frame[target_column].astype(int).map(train.LABEL_TO_CLASS)
             )
         else:
-            unknown = sorted(set(labels.unique()) - {0, 1})
+            unknown = sorted(set(labels.unique()) - set(BINARY_TARGET_VALUES))
             if unknown:
                 raise ValueError(f"Unexpected labels in {target_column}: {unknown}")
             training_frame[train.TARGET_COLUMN] = labels
@@ -513,16 +521,17 @@ def build_features_meta(
     model_mode = profiles[0]["mode"] if len(profiles) == 1 else "long_short"
     timeframe_profile_name = profiles[0]["timeframe_profile"]
     timeframe_profile = cfg.get_timeframe_profile(timeframe_profile_name)
+    labeler = TripleBarrierLabeler(timeframe=timeframe_profile["timeframe"])
     profile_modes = {profile["mode"] for profile in profiles}
     probability_semantics = {
         "p_long": (
-            "P(Target=1)" if model_mode == "dual"
-            else "P(TargetLong=1)" if "long" in profile_modes
+            f"P({TARGET_COLUMN}=1)" if model_mode == "dual"
+            else f"P({TARGET_LONG_COLUMN}=1)" if "long" in profile_modes
             else "unavailable; constant 0"
         ),
         "p_short": (
-            "P(Target=-1)" if model_mode == "dual"
-            else "P(TargetShort=1)" if "short" in profile_modes
+            f"P({TARGET_COLUMN}=-1)" if model_mode == "dual"
+            else f"P({TARGET_SHORT_COLUMN}=1)" if "short" in profile_modes
             else "unavailable; constant 0"
         ),
     }
@@ -543,6 +552,7 @@ def build_features_meta(
             for profile in profiles
         },
         "labeling_contract": str(getattr(cfg, "LABELING_CONTRACT_VERSION", "")),
+        "labeling_metadata": labeler.metadata(),
         "probability_semantics": probability_semantics,
         "symbols": list(symbols),
         "rows": int(len(predictions)),

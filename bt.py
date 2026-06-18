@@ -6,6 +6,7 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 from config import *
+from src.labeling import TripleBarrierLabeler
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
 
 # Futures settings come from config.py
@@ -190,11 +191,7 @@ def format_percent_value(value: float) -> str:
 
 
 def compute_net_pnl_pct(direction: int, entry_price: float, exit_price: float) -> float:
-    if direction == 1:
-        raw_pnl = (exit_price - entry_price) / entry_price
-    else:
-        raw_pnl = (entry_price - exit_price) / entry_price
-    return raw_pnl - (TAKER_COM + TAKER_COM)
+    return TripleBarrierLabeler.compute_clean_pnl(direction, entry_price, exit_price)
 
 
 def compute_trade_outcome(position: dict, exit_price: float) -> tuple[float, float, float]:
@@ -214,30 +211,19 @@ def resolve_trade_exit(
     stop_pct: float,
     take_pct: float,
 ) -> tuple[float | None, str | None]:
-    if direction == 1:
-        stop_price = entry_price * (1 - stop_pct)
-        take_price = entry_price * (1 + take_pct)
-        if next_low <= stop_price:
-            exit_price = (next_open if next_open < stop_price else stop_price) * (1 - SLIPPAGE)
-            return exit_price, "SL"
-        if next_high >= take_price:
-            exit_price = take_price * (1 - SLIPPAGE)
-            return exit_price, "TP"
-    else:
-        stop_price = entry_price * (1 + stop_pct)
-        take_price = entry_price * (1 - take_pct)
-        if next_high >= stop_price:
-            exit_price = (next_open if next_open > stop_price else stop_price) * (1 + SLIPPAGE)
-            return exit_price, "SL"
-        if next_low <= take_price:
-            exit_price = take_price * (1 + SLIPPAGE)
-            return exit_price, "TP"
-    return None, None
+    return TripleBarrierLabeler.resolve_trade_exit(
+        direction,
+        entry_price,
+        next_open,
+        next_high,
+        next_low,
+        stop_pct,
+        take_pct,
+    )
 
 
 def resolve_vertical_barrier_exit(direction: int, close_price: float) -> tuple[float, str]:
-    exit_price = close_price * (1 - SLIPPAGE) if direction == 1 else close_price * (1 + SLIPPAGE)
-    return exit_price, "TIMEOUT"
+    return TripleBarrierLabeler.resolve_vertical_barrier_exit(direction, close_price)
 
 
 def resolve_entry_candidate_exit(candidate: dict, market_batch: dict) -> tuple[float | None, str | None]:

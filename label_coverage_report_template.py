@@ -137,6 +137,28 @@ LABEL_COVERAGE_HTML_TEMPLATE = """<!doctype html>
 
     <section class="grid two section">
       <div class="panel">
+        <h2>Качество исходов и net PnL</h2>
+        <div class="table-wrap">{outcome_quality_table}</div>
+      </div>
+      <div class="panel">
+        <h2>Пересечение Long / Short labels</h2>
+        <div class="table-wrap">{overlap_table}</div>
+      </div>
+    </section>
+
+    <section class="grid two section">
+      <div class="panel">
+        <h2>Зависимость от adaptive horizon</h2>
+        <div class="table-wrap">{horizon_quality_table}</div>
+      </div>
+      <div class="panel">
+        <h2>Распределение барьеров и horizon</h2>
+        <div class="table-wrap">{barrier_summary_table}</div>
+      </div>
+    </section>
+
+    <section class="grid two section">
+      <div class="panel">
         <h2>Самые слабые месяцы</h2>
         <div class="table-wrap">{weakest_months_table}</div>
       </div>
@@ -152,6 +174,11 @@ LABEL_COVERAGE_HTML_TEMPLATE = """<!doctype html>
     </section>
 
     <section class="panel section">
+      <h2>Качество labels по символам</h2>
+      <div class="table-wrap">{by_symbol_quality_table}</div>
+    </section>
+
+    <section class="panel section">
       <h2>Оценка LSTM sequence samples</h2>
       <div class="table-wrap">{sequence_samples_table}</div>
     </section>
@@ -160,6 +187,11 @@ LABEL_COVERAGE_HTML_TEMPLATE = """<!doctype html>
       <h2>Помесячное покрытие</h2>
       <div class="filters" id="monthly-year-filters">{monthly_year_filters}</div>
       <div class="table-wrap">{monthly_table}</div>
+    </section>
+
+    <section class="panel section">
+      <h2>Помесячное качество labels и PnL</h2>
+      <div class="table-wrap">{monthly_quality_table}</div>
     </section>
 
     <section class="note section">

@@ -1,5 +1,11 @@
 from .timeframes import TIMEFRAME_PROFILES
 
+from src.labeling import (
+    TARGET_COLUMN,
+    TARGET_LONG_COLUMN,
+    TARGET_SHORT_COLUMN,
+)
+
 
 ENABLE_FEATURE_CLIP = True
 FEATURE_CLIP_LOWER_Q = 0.01
@@ -67,14 +73,14 @@ MODEL_PROFILES = {
         "mode": "dual",
         "timeframe_profile": "1h_v1",
         "feature_profile": "dual_v1",
-        "target_column": "Target",
+        "target_column": TARGET_COLUMN,
         "artifact_name": "lightgbm_target",
     },
     "long_v1": {
         "mode": "long",
         "timeframe_profile": "1h_v1",
         "feature_profile": "long_v1",
-        "target_column": "TargetLong",
+        "target_column": TARGET_LONG_COLUMN,
         "positive_label": 1,
         "artifact_name": "lightgbm_long",
     },
@@ -82,7 +88,7 @@ MODEL_PROFILES = {
         "mode": "short",
         "timeframe_profile": "1h_v1",
         "feature_profile": "short_v1",
-        "target_column": "TargetShort",
+        "target_column": TARGET_SHORT_COLUMN,
         "positive_label": 1,
         "artifact_name": "lightgbm_short",
     },
@@ -90,14 +96,14 @@ MODEL_PROFILES = {
         "mode": "dual",
         "timeframe_profile": "15m_v1",
         "feature_profile": "dual_15m_v1",
-        "target_column": "Target",
+        "target_column": TARGET_COLUMN,
         "artifact_name": "lightgbm_target_15m",
     },
     "long_15m_v1": {
         "mode": "long",
         "timeframe_profile": "15m_v1",
         "feature_profile": "long_15m_v1",
-        "target_column": "TargetLong",
+        "target_column": TARGET_LONG_COLUMN,
         "positive_label": 1,
         "artifact_name": "lightgbm_long_15m",
     },
@@ -105,7 +111,7 @@ MODEL_PROFILES = {
         "mode": "short",
         "timeframe_profile": "15m_v1",
         "feature_profile": "short_15m_v1",
-        "target_column": "TargetShort",
+        "target_column": TARGET_SHORT_COLUMN,
         "positive_label": 1,
         "artifact_name": "lightgbm_short_15m",
     },

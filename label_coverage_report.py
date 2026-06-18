@@ -10,11 +10,26 @@ import pandas as pd
 import config as cfg
 import train
 from label_coverage_report_template import LABEL_COVERAGE_HTML_TEMPLATE
+from src.labeling import (
+    BARRIER_STOP_PCT_COLUMN,
+    BARRIER_TAKE_PCT_COLUMN,
+    BINARY_TARGET_VALUES,
+    DUAL_TARGET_VALUES,
+    EXIT_REASONS,
+    LABEL_DIAGNOSTIC_COLUMNS,
+    LABEL_HORIZON_BARS_COLUMN,
+    LONG_EXIT_REASON_COLUMN,
+    LONG_LABEL_PNL_COLUMN,
+    SHORT_EXIT_REASON_COLUMN,
+    SHORT_LABEL_PNL_COLUMN,
+    TARGET_LONG_COLUMN,
+    TARGET_SHORT_COLUMN,
+)
 from src.persistence.repositories.historical_kline_repo import HistoricalKlineRepository
 from src.timeframes import duration_to_bars
 
 
-TARGET_VALUES = (-1, 0, 1)
+TARGET_VALUES = DUAL_TARGET_VALUES
 
 
 def parse_args():
@@ -183,6 +198,16 @@ def load_target_frame(
     repository = HistoricalKlineRepository(db_path=db_path)
     timeframe = report_profile["timeframe"]
     frame = repository.load_feature_dataset(symbols, timeframe=timeframe)
+    required_diagnostics = LABEL_DIAGNOSTIC_COLUMNS | set(
+        train.LABELING_CONTRACT_COLUMNS
+    )
+    missing_diagnostics = sorted(required_diagnostics - set(frame.columns))
+    if missing_diagnostics:
+        raise RuntimeError(
+            "Feature dataset uses the old label diagnostics contract and is missing "
+            f"{missing_diagnostics}. Re-run etl.py for "
+            f"'{report_profile['timeframe_profile']}'."
+        )
     source_target = report_profile["target_column"]
     if source_target not in frame.columns:
         raise RuntimeError(
@@ -218,13 +243,13 @@ def load_target_frame(
     )
     mode = report_profile["mode"]
     if mode == "dual":
-        allowed_source_values = {-1, 0, 1}
+        allowed_source_values = set(DUAL_TARGET_VALUES)
         frame[train.TARGET_COLUMN] = source_labels
     elif mode == "long":
-        allowed_source_values = {0, 1}
+        allowed_source_values = set(BINARY_TARGET_VALUES)
         frame[train.TARGET_COLUMN] = source_labels
     elif mode == "short":
-        allowed_source_values = {0, 1}
+        allowed_source_values = set(BINARY_TARGET_VALUES)
         frame[train.TARGET_COLUMN] = -source_labels
     else:
         raise ValueError(f"Unsupported model mode: {mode}")
@@ -235,6 +260,21 @@ def load_target_frame(
     unknown = sorted(set(frame[train.TARGET_COLUMN].unique()) - set(TARGET_VALUES))
     if unknown:
         raise ValueError(f"Unexpected values in {source_target}: {unknown}")
+    for direction in ("long", "short"):
+        pnl_column = LONG_LABEL_PNL_COLUMN if direction == "long" else SHORT_LABEL_PNL_COLUMN
+        reason_column = LONG_EXIT_REASON_COLUMN if direction == "long" else SHORT_EXIT_REASON_COLUMN
+        pnl_values = pd.to_numeric(frame[pnl_column], errors="raise").to_numpy(
+            dtype=float
+        )
+        if not np.isfinite(pnl_values).all():
+            raise ValueError(f"{pnl_column} contains non-finite values.")
+        unknown_reasons = sorted(
+            set(frame[reason_column].astype(str).unique()) - set(EXIT_REASONS)
+        )
+        if unknown_reasons:
+            raise ValueError(
+                f"{reason_column} contains unexpected values: {unknown_reasons}"
+            )
     return frame.sort_values([train.SYMBOL_COLUMN, train.TIMESTAMP_COLUMN]).reset_index(drop=True)
 
 
@@ -249,6 +289,8 @@ def format_number(value) -> str:
         return f"{int(value):,}"
     if isinstance(value, (float, np.floating)):
         if np.isfinite(value):
+            if float(value).is_integer():
+                return f"{int(value):,}"
             return f"{float(value):,.4f}"
         return "inf"
     return str(value)
@@ -300,6 +342,169 @@ def build_target_summary(frame: pd.DataFrame, group_columns: Iterable[str] = ())
     return pd.DataFrame(rows)[columns]
 
 
+def profile_directions(report_profile: dict) -> list[str]:
+    if report_profile["mode"] == "dual":
+        return ["long", "short"]
+    return [report_profile["mode"]]
+
+
+def build_outcome_quality(
+    frame: pd.DataFrame,
+    report_profile: dict,
+    group_columns: Iterable[str] = (),
+) -> pd.DataFrame:
+    group_columns = list(group_columns)
+    grouped = (
+        frame.groupby(group_columns, observed=True, dropna=False)
+        if group_columns
+        else [((), frame)]
+    )
+    rows = []
+    for key, group in grouped:
+        if not isinstance(key, tuple):
+            key = (key,)
+        for direction in profile_directions(report_profile):
+            target_column = TARGET_LONG_COLUMN if direction == "long" else TARGET_SHORT_COLUMN
+            pnl_column = f"{direction}_label_pnl"
+            reason_column = f"{direction}_exit_reason"
+            labels = pd.to_numeric(group[target_column], errors="raise").astype(int)
+            pnls = pd.to_numeric(group[pnl_column], errors="raise").astype(float)
+            reasons = group[reason_column].astype(str)
+            reason_counts = reasons.value_counts().to_dict()
+            total = int(len(group))
+            timeout_mask = reasons.eq("TIMEOUT")
+            timeout_rows = int(timeout_mask.sum())
+            timeout_positive_rows = int((timeout_mask & pnls.gt(0)).sum())
+            timeout_negative_rows = timeout_rows - timeout_positive_rows
+            row = {
+                "direction": direction,
+                "rows": total,
+                "positive": int(labels.sum()),
+                "positive_rate": float(labels.mean()) if total else 0.0,
+                "mean_net_pnl": float(pnls.mean()) if total else 0.0,
+                "median_net_pnl": float(pnls.median()) if total else 0.0,
+                "p10_net_pnl": float(pnls.quantile(0.10)) if total else 0.0,
+                "p90_net_pnl": float(pnls.quantile(0.90)) if total else 0.0,
+                "tp_rows": int(reason_counts.get("TP", 0)),
+                "sl_rows": int(reason_counts.get("SL", 0)),
+                "timeout_rows": timeout_rows,
+                "timeout_positive_rows": timeout_positive_rows,
+                "timeout_negative_rows": timeout_negative_rows,
+                "tp_rate": int(reason_counts.get("TP", 0)) / total if total else 0.0,
+                "sl_rate": int(reason_counts.get("SL", 0)) / total if total else 0.0,
+                "timeout_rate": timeout_rows / total if total else 0.0,
+                "timeout_positive_rate": (
+                    timeout_positive_rows / timeout_rows if timeout_rows else 0.0
+                ),
+                "timeout_negative_rate": (
+                    timeout_negative_rows / timeout_rows if timeout_rows else 0.0
+                ),
+            }
+            for column, value in zip(group_columns, key, strict=False):
+                row[column] = value
+            rows.append(row)
+    columns = group_columns + [
+        "direction",
+        "rows",
+        "positive",
+        "positive_rate",
+        "mean_net_pnl",
+        "median_net_pnl",
+        "p10_net_pnl",
+        "p90_net_pnl",
+        "tp_rows",
+        "sl_rows",
+        "timeout_rows",
+        "timeout_positive_rows",
+        "timeout_negative_rows",
+        "tp_rate",
+        "sl_rate",
+        "timeout_rate",
+        "timeout_positive_rate",
+        "timeout_negative_rate",
+    ]
+    return pd.DataFrame(rows)[columns]
+
+
+def build_overlap_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    long_positive = pd.to_numeric(frame[TARGET_LONG_COLUMN], errors="raise").astype(int).eq(1)
+    short_positive = pd.to_numeric(frame[TARGET_SHORT_COLUMN], errors="raise").astype(int).eq(1)
+    total = max(len(frame), 1)
+    rows = [
+        ("long_only", int((long_positive & ~short_positive).sum())),
+        ("short_only", int((short_positive & ~long_positive).sum())),
+        ("both_positive", int((long_positive & short_positive).sum())),
+        ("neither_positive", int((~long_positive & ~short_positive).sum())),
+    ]
+    return pd.DataFrame(
+        [
+            {"label_state": name, "rows": count, "rate": count / total}
+            for name, count in rows
+        ]
+    )
+
+
+def build_horizon_quality(frame: pd.DataFrame, report_profile: dict) -> pd.DataFrame:
+    rows = []
+    grouped = frame.groupby(LABEL_HORIZON_BARS_COLUMN, observed=True, dropna=False)
+    for horizon, group in grouped:
+        row = {
+            "horizon_bars": int(horizon),
+            "rows": int(len(group)),
+            "long_positive_rate": float(group[TARGET_LONG_COLUMN].mean()),
+            "short_positive_rate": float(group[TARGET_SHORT_COLUMN].mean()),
+            "overlap_rate": float(
+                (
+                    group[TARGET_LONG_COLUMN].astype(int).eq(1)
+                    & group[TARGET_SHORT_COLUMN].astype(int).eq(1)
+                ).mean()
+            ),
+        }
+        for direction in profile_directions(report_profile):
+            pnl_column = LONG_LABEL_PNL_COLUMN if direction == "long" else SHORT_LABEL_PNL_COLUMN
+            pnls = pd.to_numeric(group[pnl_column], errors="raise")
+            reasons = group[f"{direction}_exit_reason"].astype(str)
+            row[f"{direction}_mean_pnl"] = float(pnls.mean())
+            row[f"{direction}_timeout_rate"] = float(reasons.eq("TIMEOUT").mean())
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("horizon_bars").reset_index(drop=True)
+
+
+def build_barrier_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for column in (BARRIER_STOP_PCT_COLUMN, BARRIER_TAKE_PCT_COLUMN, LABEL_HORIZON_BARS_COLUMN):
+        values = pd.to_numeric(frame[column], errors="raise").astype(float)
+        rows.append(
+            {
+                "metric": column,
+                "mean": float(values.mean()),
+                "p10": float(values.quantile(0.10)),
+                "p50": float(values.median()),
+                "p90": float(values.quantile(0.90)),
+                "min": float(values.min()),
+                "max": float(values.max()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def format_barrier_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    printable = frame.copy()
+    value_columns = ("mean", "p10", "p50", "p90", "min", "max")
+    printable[list(value_columns)] = printable[list(value_columns)].astype(object)
+    percentage_mask = printable["metric"].isin(
+        [BARRIER_STOP_PCT_COLUMN, BARRIER_TAKE_PCT_COLUMN]
+    )
+    for column in value_columns:
+        printable.loc[percentage_mask, column] = printable.loc[
+            percentage_mask, column
+        ].map(percent)
+        printable.loc[~percentage_mask, column] = printable.loc[
+            ~percentage_mask, column
+        ].map(lambda value: f"{float(value):.2f}")
+    return printable
+
+
 def estimate_sequence_samples(
     frame: pd.DataFrame,
     sequence_windows: list[int] | list[tuple[str, int]],
@@ -340,14 +545,14 @@ def label_semantics(report_profile: dict) -> dict:
     if mode == "long":
         return {
             "signal_name": "Long-positive",
-            "signal_description": "TargetLong = 1",
+            "signal_description": f"{TARGET_LONG_COLUMN} = 1",
             "negative_name": "Short (not modeled)",
             "neutral_name": "No signal",
             "positive_name": "Long",
         }
     return {
         "signal_name": "Short-positive",
-        "signal_description": "TargetShort = 1",
+        "signal_description": f"{TARGET_SHORT_COLUMN} = 1",
         "negative_name": "Short",
         "neutral_name": "No signal",
         "positive_name": "Long (not modeled)",
@@ -397,6 +602,14 @@ def print_config_snapshot(
         print(f"  SL_PCT={float(getattr(cfg, 'SL_PCT', 0.0)):.4f}")
     print(f"  TAKER_COM={float(getattr(cfg, 'TAKER_COM', 0.0)):.6f}")
     print(f"  SLIPPAGE={float(getattr(cfg, 'SLIPPAGE', 0.0)):.6f}")
+    print(
+        "  LABELING_CONTRACT="
+        f"{str(getattr(cfg, 'LABELING_CONTRACT_VERSION', 'unknown'))}"
+    )
+    print(
+        "  VERTICAL_BARRIER_EXIT="
+        f"{str(getattr(cfg, 'VERTICAL_BARRIER_EXIT', 'unknown'))}"
+    )
     print()
 
 
@@ -410,10 +623,55 @@ def print_summary_table(title: str, summary: pd.DataFrame) -> None:
     print()
 
 
+def print_quality_table(title: str, frame: pd.DataFrame) -> None:
+    printable = frame.copy()
+    percent_columns = {
+        "positive_rate",
+        "positive_rate_delta",
+        "mean_net_pnl",
+        "median_net_pnl",
+        "p10_net_pnl",
+        "p90_net_pnl",
+        "tp_rate",
+        "sl_rate",
+        "timeout_rate",
+        "timeout_positive_rate",
+        "timeout_negative_rate",
+        "rate",
+        "long_positive_rate",
+        "short_positive_rate",
+        "overlap_rate",
+        "long_mean_pnl",
+        "short_mean_pnl",
+        "long_timeout_rate",
+        "short_timeout_rate",
+    }
+    for column in percent_columns.intersection(printable.columns):
+        printable[column] = printable[column].map(percent)
+    print(title)
+    print(printable.to_string(index=False))
+    print()
+
+
 def build_monthly_frame(frame: pd.DataFrame) -> pd.DataFrame:
     monthly_frame = frame.copy()
     monthly_frame["month"] = monthly_frame[train.TIMESTAMP_COLUMN].dt.to_period("M").astype(str)
     return build_target_summary(monthly_frame, ["month"]).sort_values("month").reset_index(drop=True)
+
+
+def build_monthly_quality(frame: pd.DataFrame, report_profile: dict) -> pd.DataFrame:
+    monthly_frame = frame.copy()
+    monthly_frame["month"] = monthly_frame[train.TIMESTAMP_COLUMN].dt.to_period("M").astype(str)
+    quality = build_outcome_quality(monthly_frame, report_profile, ["month"])
+    overall = build_outcome_quality(frame, report_profile).set_index("direction")
+    quality["positive_rate_delta"] = quality.apply(
+        lambda row: (
+            float(row["positive_rate"])
+            - float(overall.loc[row["direction"], "positive_rate"])
+        ),
+        axis=1,
+    )
+    return quality.sort_values(["month", "direction"]).reset_index(drop=True)
 
 
 def build_monthly_stability(monthly: pd.DataFrame, low_ratio: float) -> dict:
@@ -666,6 +924,14 @@ def build_config_items(
         config_item("RVOL multiplier", f"{float(getattr(cfg, 'BARRIER_RVOL_MULTIPLIER', 0.0)):.2f}"),
         config_item("Taker commission", f"{float(getattr(cfg, 'TAKER_COM', 0.0)):.6f}"),
         config_item("Slippage", f"{float(getattr(cfg, 'SLIPPAGE', 0.0)):.6f}"),
+        config_item(
+            "Labeling contract",
+            str(getattr(cfg, "LABELING_CONTRACT_VERSION", "unknown")),
+        ),
+        config_item(
+            "Vertical barrier exit",
+            str(getattr(cfg, "VERTICAL_BARRIER_EXIT", "unknown")),
+        ),
         config_item("END_DATE", str(getattr(cfg, "END_DATE", None))),
     ]
     if sequence_windows:
@@ -705,7 +971,32 @@ def render_html_report(
     report_profile = report_profile or resolve_report_profile()
     semantics = label_semantics(report_profile)
     stability = build_monthly_stability(monthly, low_ratio)
+    outcome_quality = build_outcome_quality(frame, report_profile)
+    by_symbol_quality = build_outcome_quality(
+        frame,
+        report_profile,
+        [train.SYMBOL_COLUMN],
+    )
+    overlap = build_overlap_summary(frame)
+    horizon_quality = build_horizon_quality(frame, report_profile)
+    barrier_summary = build_barrier_summary(frame)
+    monthly_quality = build_monthly_quality(frame, report_profile)
     overall_row = overall.iloc[0]
+    quality_rows = max(int(outcome_quality["rows"].sum()), 1)
+    timeout_rows = int(outcome_quality["timeout_rows"].sum())
+    mean_label_pnl = float(
+        (
+            outcome_quality["mean_net_pnl"]
+            * outcome_quality["rows"]
+        ).sum()
+        / quality_rows
+    )
+    timeout_rate = timeout_rows / quality_rows
+    timeout_positive_rate = (
+        int(outcome_quality["timeout_positive_rows"].sum()) / timeout_rows
+        if timeout_rows
+        else 0.0
+    )
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     title = f"Label Coverage Report: {report_profile['name']}"
     subtitle = (
@@ -758,6 +1049,24 @@ def render_html_report(
             metric_card("Monthly CV", f"{stability['cv']:.3f}", "ниже = стабильнее", "yellow"),
             metric_card("Max/min", "inf" if not np.isfinite(stability["max_to_min"]) else f"{stability['max_to_min']:.2f}x", "разброс месяцев", "purple"),
             metric_card("Low months", str(len(stability["low_months"])), f"ниже {percent(stability['low_threshold'])}", "red"),
+            metric_card(
+                "Mean label net PnL",
+                percent(mean_label_pnl),
+                "после комиссий и slippage",
+                "green" if mean_label_pnl >= 0 else "red",
+            ),
+            metric_card(
+                "Timeout share",
+                percent(timeout_rate),
+                "vertical barrier exits",
+                "yellow",
+            ),
+            metric_card(
+                "Timeout positive",
+                percent(timeout_positive_rate),
+                "прибыльных среди TIMEOUT",
+                "blue",
+            ),
         ]
     )
     stability_summary = (
@@ -784,7 +1093,47 @@ def render_html_report(
         stability_summary=stability_summary,
         weakest_months_table=html_table(stability["weakest"], percent_columns=("directional_rate",)),
         strongest_months_table=html_table(stability["strongest"], percent_columns=("directional_rate",)),
+        outcome_quality_table=html_table(
+            outcome_quality,
+            percent_columns=(
+                "positive_rate",
+                "mean_net_pnl",
+                "median_net_pnl",
+                "p10_net_pnl",
+                "p90_net_pnl",
+                "tp_rate",
+                "sl_rate",
+                "timeout_rate",
+                "timeout_positive_rate",
+                "timeout_negative_rate",
+            ),
+        ),
+        overlap_table=html_table(overlap, percent_columns=("rate",)),
+        horizon_quality_table=html_table(
+            horizon_quality,
+            percent_columns=tuple(
+                column
+                for column in horizon_quality.columns
+                if column.endswith("_rate") or column.endswith("_pnl")
+            ),
+        ),
+        barrier_summary_table=html_table(format_barrier_summary(barrier_summary)),
         by_symbol_table=html_table(by_symbol, percent_columns=percent_columns),
+        by_symbol_quality_table=html_table(
+            by_symbol_quality,
+            percent_columns=(
+                "positive_rate",
+                "mean_net_pnl",
+                "median_net_pnl",
+                "p10_net_pnl",
+                "p90_net_pnl",
+                "tp_rate",
+                "sl_rate",
+                "timeout_rate",
+                "timeout_positive_rate",
+                "timeout_negative_rate",
+            ),
+        ),
         sequence_samples_table=html_table(sequence_samples),
         monthly_year_filters=build_year_filter_buttons(monthly),
         monthly_table=html_table(
@@ -793,10 +1142,26 @@ def render_html_report(
             table_id="monthly-coverage-table",
             row_year_column="month",
         ),
+        monthly_quality_table=html_table(
+            monthly_quality,
+            percent_columns=(
+                "positive_rate",
+                "positive_rate_delta",
+                "mean_net_pnl",
+                "median_net_pnl",
+                "p10_net_pnl",
+                "p90_net_pnl",
+                "tp_rate",
+                "sl_rate",
+                "timeout_rate",
+                "timeout_positive_rate",
+                "timeout_negative_rate",
+            ),
+        ),
         interpretation_note=escape(
-            "Смотри не только общий directional coverage, но и месячный CV/max-min. "
-            "Если несколько месяцев сильно ниже среднего, labels зависят от режима рынка, "
-            "и модель может переобучаться на редкие периоды с высокой торговой активностью."
+            "Coverage показывает баланс классов, но не качество модели. Проверяй отдельно "
+            "причины выхода, net PnL, долю прибыльных TIMEOUT, overlap long/short и drift "
+            "по месяцам. ROC AUC, PR AUC, MCC и торговый PnL находятся в train/backtest."
         ),
     )
     output.write_text(html, encoding="utf-8")
@@ -835,6 +1200,23 @@ def main() -> None:
         by_symbol,
     )
 
+    outcome_quality = build_outcome_quality(frame, report_profile)
+    by_symbol_quality = build_outcome_quality(
+        frame,
+        report_profile,
+        [train.SYMBOL_COLUMN],
+    )
+    overlap = build_overlap_summary(frame)
+    horizon_quality = build_horizon_quality(frame, report_profile)
+    barrier_summary = build_barrier_summary(frame)
+    print_quality_table("Label outcome quality:", outcome_quality)
+    print_quality_table("Label outcome quality by symbol:", by_symbol_quality)
+    print_quality_table("Long/short label overlap:", overlap)
+    print_quality_table("Label quality by adaptive horizon:", horizon_quality)
+    print("Barrier and horizon distribution:")
+    print(format_barrier_summary(barrier_summary).to_string(index=False))
+    print()
+
     sequence_samples = estimate_sequence_samples(frame, sequence_windows)
     for duration, bars in sequence_windows:
         column = f"seq_{duration}_{bars}bars_eligible"
@@ -844,12 +1226,17 @@ def main() -> None:
     print()
 
     monthly = build_monthly_frame(frame)
+    monthly_quality = build_monthly_quality(frame, report_profile)
     print_monthly_stability(monthly, args.stability_low_ratio)
 
     if args.monthly:
         print_summary_table(
             f"Monthly {report_profile['target_column']} coverage:",
             monthly,
+        )
+        print_quality_table(
+            f"Monthly {report_profile['target_column']} quality:",
+            monthly_quality,
         )
 
     html_output = args.html_output
