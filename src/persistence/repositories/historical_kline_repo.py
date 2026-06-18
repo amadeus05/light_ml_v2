@@ -11,7 +11,7 @@ import pandas as pd
 
 import config as cfg
 from config import DB_PATH
-from src.contracts.exchange_contract import ExchangeContract
+from src.exchanges.market_data_client import MarketDataClient
 from src.persistence.sqlite_connection import create_sqlite_connection
 from src.types.common import FundingRatePoint, HistoricalKline, OpenInterestPoint, Symbol
 
@@ -514,7 +514,7 @@ class HistoricalKlineRepository:
 
     def sync_funding_rates(
         self,
-        exchange: ExchangeContract,
+        exchange: MarketDataClient,
         symbol: str | Symbol,
         start_date: str,
         end_date: str | None = None,
@@ -591,7 +591,7 @@ class HistoricalKlineRepository:
 
     def sync_premium_index_klines(
         self,
-        exchange: ExchangeContract,
+        exchange: MarketDataClient,
         symbol: str | Symbol,
         timeframe: str,
         start_date: str,
@@ -669,7 +669,7 @@ class HistoricalKlineRepository:
 
     def sync_open_interest(
         self,
-        exchange: ExchangeContract,
+        exchange: MarketDataClient,
         symbol: str | Symbol,
         timeframe: str,
         start_date: str,
@@ -817,7 +817,7 @@ class HistoricalKlineRepository:
 
     def sync_candles(
         self,
-        exchange: ExchangeContract,
+        exchange: MarketDataClient,
         symbol: str | Symbol,
         timeframe: str,
         start_date: str,

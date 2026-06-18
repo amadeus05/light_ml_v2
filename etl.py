@@ -7,7 +7,7 @@ import config as cfg
 import numpy as np
 import pandas as pd
 
-from src.contracts.exchange_contract import ExchangeContract
+from src.exchanges.market_data_client import MarketDataClient
 from src.exchanges.binance.binance_service import BinanceService
 from src.exchanges.bybit.bybit_service import BybitService
 from src.features import MasterFeatureBuilder
@@ -181,7 +181,7 @@ def finalize_feature_frame(
     return output
 
 
-def create_exchange_service() -> ExchangeContract:
+def create_exchange_service() -> MarketDataClient:
     exchange_name = str(getattr(cfg, "ACTIVE_EXCHANGE", "bybit")).strip().lower()
     if exchange_name == "bybit":
         return BybitService()

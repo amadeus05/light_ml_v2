@@ -4,7 +4,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from src.contracts.exchange_contract import ExchangeContract
+from src.exchanges.market_data_client import MarketDataClient
 from src.exchanges.binance.binance_adapter import BinanceAdapter
 from src.exchanges.binance.binance_mapper import BinanceMapper
 from src.types.common import FundingRatePoint, HistoricalKline, OpenInterestPoint, Symbol
@@ -13,7 +13,7 @@ from src.types.common import FundingRatePoint, HistoricalKline, OpenInterestPoin
 logger = logging.getLogger(__name__)
 
 
-class BinanceService(ExchangeContract):
+class BinanceService(MarketDataClient):
     def __init__(
         self,
         adapter: BinanceAdapter | None = None,

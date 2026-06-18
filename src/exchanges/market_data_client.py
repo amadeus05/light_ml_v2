@@ -5,7 +5,9 @@ from abc import ABC, abstractmethod
 from src.types.common import FundingRatePoint, HistoricalKline, OpenInterestPoint, Symbol
 
 
-class ExchangeContract(ABC):
+class MarketDataClient(ABC):
+    """Abstract client for fetching normalized historical market data from an exchange."""
+
     @abstractmethod
     def get_exchange_code(self) -> str:
         raise NotImplementedError
